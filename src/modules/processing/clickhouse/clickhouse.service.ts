@@ -25,8 +25,16 @@ export class ClickHouseService implements OnModuleInit, OnModuleDestroy {
     this.logger.log(
       `🆔 ClickHouse instance ${this.instanceId} onModuleInit called`,
     );
+    if (process.env.STORAGE_MODE !== 'clickhouse') {
+      this.logger.log(
+        `ℹ️ ClickHouse initialization skipped because STORAGE_MODE is '${process.env.STORAGE_MODE || 'not set'}' (not 'clickhouse')`,
+      );
+      return;
+    }
     await this.connect();
-    await this.initializeDatabase();
+    if (this.client) {
+      await this.initializeDatabase();
+    }
   }
 
   async onModuleDestroy() {
@@ -62,10 +70,10 @@ export class ClickHouseService implements OnModuleInit, OnModuleDestroy {
       this.logger.log(`Connected to ClickHouse version: ${rows[0]?.version}`);
     } catch (error) {
       this.logger.error(
-        `Failed to connect to ClickHouse: ${error.message}`,
+        `Failed to connect to ClickHouse: ${error.message}. Continuing without ClickHouse.`,
         error.stack,
       );
-      throw error;
+      this.client = null;
     }
   }
 

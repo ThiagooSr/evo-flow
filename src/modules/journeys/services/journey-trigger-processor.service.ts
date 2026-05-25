@@ -113,13 +113,13 @@ export class JourneyTriggerProcessor implements OnModuleInit, OnModuleDestroy {
   }
 
   async onModuleInit() {
-    if (AppFactory.shouldStartTemporalWorker()) {
+    if (AppFactory.shouldStartTemporalWorker() && this.config.queueMode === 'kafka') {
       this.logger.log('🚀 Starting Journey Trigger Processor...');
       await this.initializeKafkaConsumer();
       await this.startConsuming();
     } else {
       this.logger.log(
-        '⏭️  Journey Trigger Processor disabled (not in TEMPORAL-WORKER mode)',
+        `⏭️  Journey Trigger Processor disabled (not in TEMPORAL-WORKER mode or queue mode is ${this.config.queueMode})`,
       );
     }
   }
