@@ -71,6 +71,11 @@ describeIntegration('KafkaBrokerAdapter (integration)', () => {
       received.push(msg);
       return adapter.ack(msg);
     });
+    // kafkajs's consumer.run returns before the group rebalance completes
+    // (~3s). Without this wait, a publish issued immediately lands in the
+    // log before the consumer's starting offset, and the latest-offset reset
+    // policy skips it. Production apps don't hit this — they run forever.
+    await sleep(5_000);
 
     await adapter.publish(topic, { foo: 'bar' });
 
@@ -94,14 +99,19 @@ describeIntegration('KafkaBrokerAdapter (integration)', () => {
       }
       await adapter.ack(msg);
     });
+    await sleep(5_000); // see AC1 note above
 
     await adapter.publish(topic, { n: 42 });
 
     await waitFor(() => deliveries.length >= 2, 20_000);
     expect(deliveries[0]).toBe(42);
     expect(deliveries[1]).toBe(42); // re-delivered after nack(requeue=true)
-  }, 30_000);
+  }, 40_000);
 });
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 async function waitFor(
   predicate: () => boolean,

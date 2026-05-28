@@ -21,7 +21,8 @@ import { BrokerMetrics } from '../metrics/broker-metrics';
 const CLIENT_ID = 'evo-flow-broker';
 const DEFAULT_NUM_PARTITIONS = 12;
 const DEFAULT_REPLICATION_FACTOR = 1;
-const BACKOFF_STEPS_MS = [0, 1000, 2000, 4000, 8000, 15000];
+const CONNECT_RETRY_BUDGET_MS = 30_000;
+const CONNECT_RETRY_MAX_BACKOFF_MS = 15_000;
 const TOPIC_ALREADY_EXISTS_PATTERN = /already exists/i;
 const SUPPORTED_SASL_MECHANISMS = new Set([
   'plain',
@@ -31,6 +32,7 @@ const SUPPORTED_SASL_MECHANISMS = new Set([
 const BROKER_LABEL = 'kafka';
 
 type SaslMechanism = 'plain' | 'scram-sha-256' | 'scram-sha-512';
+type StructuredLogLevel = 'debug' | 'info' | 'warn' | 'error';
 
 interface AckHandle {
   topic: string;
@@ -50,6 +52,8 @@ export class KafkaBrokerAdapter
   private admin: Admin | null = null;
   private readonly consumers = new Map<string, Consumer>();
   private readonly pendingAcks = new WeakMap<BrokerMessage, AckHandle>();
+  private readonly ensuredTopics = new Set<string>();
+  private warnedAboutRunMode = false;
   private active = false;
 
   constructor(
@@ -70,10 +74,7 @@ export class KafkaBrokerAdapter
 
     await this.connectWithBackoff();
     this.active = true;
-    this.logger.log('broker.boot', {
-      action: 'broker.boot',
-      broker: BROKER_LABEL,
-    });
+    this.writeStructured('info', 'broker.boot', { broker: BROKER_LABEL });
   }
 
   async onModuleDestroy(): Promise<void> {
@@ -83,9 +84,11 @@ export class KafkaBrokerAdapter
       try {
         await consumer.disconnect();
       } catch (err) {
-        this.logger.warn(
-          `KafkaBrokerAdapter consumer disconnect failed for "${topic}": ${(err as Error).message}`,
-        );
+        this.writeStructured('warn', 'broker.shutdown.consumer_failed', {
+          broker: BROKER_LABEL,
+          topic,
+          error: (err as Error).message,
+        });
       }
     }
     this.consumers.clear();
@@ -93,16 +96,18 @@ export class KafkaBrokerAdapter
     try {
       await this.producer?.disconnect();
     } catch (err) {
-      this.logger.warn(
-        `KafkaBrokerAdapter producer disconnect failed: ${(err as Error).message}`,
-      );
+      this.writeStructured('warn', 'broker.shutdown.producer_failed', {
+        broker: BROKER_LABEL,
+        error: (err as Error).message,
+      });
     }
     try {
       await this.admin?.disconnect();
     } catch (err) {
-      this.logger.warn(
-        `KafkaBrokerAdapter admin disconnect failed: ${(err as Error).message}`,
-      );
+      this.writeStructured('warn', 'broker.shutdown.admin_failed', {
+        broker: BROKER_LABEL,
+        error: (err as Error).message,
+      });
     }
 
     this.active = false;
@@ -110,6 +115,8 @@ export class KafkaBrokerAdapter
 
   async publish<T>(topic: string, payload: T): Promise<void> {
     this.assertActive('publish');
+
+    await this.ensureTopicExists(topic);
 
     const correlationId = randomUUID();
     const messageId = randomUUID();
@@ -129,8 +136,7 @@ export class KafkaBrokerAdapter
       ],
     });
 
-    this.logger.log('broker.publish', {
-      action: 'broker.publish',
+    this.writeStructured('debug', 'broker.publish', {
       broker: BROKER_LABEL,
       topic,
       correlationId,
@@ -152,9 +158,18 @@ export class KafkaBrokerAdapter
 
     await this.ensureTopicExists(topic);
 
-    const runMode = this.config.get<string>('RUN_MODE') ?? 'single';
-    const groupId = `${runMode}-${topic}`;
+    const groupId = `${this.resolveRunMode(topic)}-${topic}`;
     const consumer = this.kafka!.consumer({ groupId });
+
+    consumer.on(consumer.events.CRASH, (event) => {
+      this.writeStructured('error', 'broker.consumer.crash', {
+        broker: BROKER_LABEL,
+        topic,
+        groupId,
+        restart: event.payload?.restart,
+        error: event.payload?.error?.message,
+      });
+    });
 
     await consumer.connect();
     await consumer.subscribe({ topic, fromBeginning: false });
@@ -166,8 +181,7 @@ export class KafkaBrokerAdapter
     });
 
     this.consumers.set(topic, consumer);
-    this.logger.log('broker.subscribe', {
-      action: 'broker.subscribe',
+    this.writeStructured('info', 'broker.subscribe', {
       broker: BROKER_LABEL,
       topic,
       groupId,
@@ -191,8 +205,7 @@ export class KafkaBrokerAdapter
     ]);
 
     this.pendingAcks.delete(msg);
-    this.logger.log('broker.ack', {
-      action: 'broker.ack',
+    this.writeStructured('debug', 'broker.ack', {
       broker: BROKER_LABEL,
       topic: handle.topic,
       correlationId: msg.headers.correlationId,
@@ -218,8 +231,7 @@ export class KafkaBrokerAdapter
         offset: handle.offset,
       });
       this.pendingAcks.delete(msg);
-      this.logger.log('broker.nack.requeue', {
-        action: 'broker.nack.requeue',
+      this.writeStructured('info', 'broker.nack.requeue', {
         broker: BROKER_LABEL,
         topic: handle.topic,
         correlationId: msg.headers.correlationId,
@@ -240,8 +252,7 @@ export class KafkaBrokerAdapter
       topic: handle.topic,
     });
     this.pendingAcks.delete(msg);
-    this.logger.log('broker.nack.terminal', {
-      action: 'broker.nack.terminal',
+    this.writeStructured('info', 'broker.nack.terminal', {
       broker: BROKER_LABEL,
       topic: handle.topic,
       correlationId: msg.headers.correlationId,
@@ -262,9 +273,15 @@ export class KafkaBrokerAdapter
       parsed = JSON.parse(message.value?.toString('utf8') ?? 'null') as T;
     } catch (err) {
       // Poison pill: skip the message permanently to keep the consumer moving.
-      this.logger.error(
-        `broker.consume.poison topic="${topic}" partition=${partition} offset=${message.offset}: ${(err as Error).message}`,
-      );
+      this.writeStructured('error', 'broker.consume.poison', {
+        broker: BROKER_LABEL,
+        topic,
+        partition,
+        offset: message.offset,
+        correlationId: headers.correlationId,
+        messageId: headers.messageId,
+        error: (err as Error).message,
+      });
       this.metrics.terminalFailures.inc({ broker: BROKER_LABEL, topic });
       await consumer.commitOffsets([
         { topic, partition, offset: String(Number(message.offset) + 1) },
@@ -285,8 +302,7 @@ export class KafkaBrokerAdapter
       consumer,
     });
 
-    this.logger.log('broker.consume', {
-      action: 'broker.consume',
+    this.writeStructured('debug', 'broker.consume', {
       broker: BROKER_LABEL,
       topic,
       partition,
@@ -300,9 +316,15 @@ export class KafkaBrokerAdapter
     } catch (err) {
       // Handler did not ack/nack — leave the offset uncommitted so Kafka
       // re-delivers on the next session. Surface the error for visibility.
-      this.logger.error(
-        `broker.consume.handler_error topic="${topic}" offset=${message.offset}: ${(err as Error).message}`,
-      );
+      this.writeStructured('error', 'broker.consume.handler_error', {
+        broker: BROKER_LABEL,
+        topic,
+        partition,
+        offset: message.offset,
+        correlationId: headers.correlationId,
+        messageId: headers.messageId,
+        error: (err as Error).message,
+      });
     }
   }
 
@@ -321,6 +343,7 @@ export class KafkaBrokerAdapter
   }
 
   private async ensureTopicExists(topic: string): Promise<void> {
+    if (this.ensuredTopics.has(topic)) return;
     try {
       await this.admin!.createTopics({
         topics: [
@@ -334,9 +357,24 @@ export class KafkaBrokerAdapter
       });
     } catch (err) {
       const message = (err as Error).message ?? '';
-      if (TOPIC_ALREADY_EXISTS_PATTERN.test(message)) return;
-      throw err;
+      if (!TOPIC_ALREADY_EXISTS_PATTERN.test(message)) throw err;
     }
+    this.ensuredTopics.add(topic);
+  }
+
+  private resolveRunMode(topic: string): string {
+    const runMode = this.config.get<string>('RUN_MODE');
+    if (runMode) return runMode;
+    if (!this.warnedAboutRunMode) {
+      this.writeStructured('warn', 'broker.subscribe.no_run_mode', {
+        broker: BROKER_LABEL,
+        topic,
+        fallback: 'single',
+        hint: 'Set RUN_MODE so consumer groups isolate per pipeline mode.',
+      });
+      this.warnedAboutRunMode = true;
+    }
+    return 'single';
   }
 
   private buildKafkaClient(): Kafka {
@@ -395,23 +433,42 @@ export class KafkaBrokerAdapter
   }
 
   private async connectWithBackoff(): Promise<void> {
+    const startTime = Date.now();
+    const deadline = startTime + CONNECT_RETRY_BUDGET_MS;
     let lastErr: Error | null = null;
-    for (const wait of BACKOFF_STEPS_MS) {
-      if (wait > 0) await this.sleep(wait);
+    let attempt = 0;
+
+    while (true) {
+      attempt++;
       try {
         await this.admin!.connect();
         await this.producer!.connect();
         return;
       } catch (err) {
         lastErr = err as Error;
-        this.logger.warn(
-          `KafkaBrokerAdapter connect attempt failed (waited ${wait}ms): ${lastErr.message}`,
+        this.writeStructured('warn', 'broker.connect.retry', {
+          broker: BROKER_LABEL,
+          attempt,
+          elapsedMs: Date.now() - startTime,
+          error: lastErr.message,
+        });
+      }
+
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) {
+        throw new Error(
+          `KafkaBrokerAdapter failed to connect within ${CONNECT_RETRY_BUDGET_MS / 1000}s retry budget (${attempt} attempts): ${lastErr.message}`,
         );
       }
+
+      const exponential = 1000 * Math.pow(2, attempt - 1);
+      const wait = Math.min(
+        exponential,
+        CONNECT_RETRY_MAX_BACKOFF_MS,
+        remaining,
+      );
+      await this.sleep(wait);
     }
-    throw new Error(
-      `KafkaBrokerAdapter failed to connect after 30s retry budget: ${lastErr?.message ?? 'unknown error'}`,
-    );
   }
 
   private assertActive(op: string): void {
@@ -424,5 +481,35 @@ export class KafkaBrokerAdapter
 
   private sleep(ms: number): Promise<void> {
     return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  /**
+   * Emit a structured log line that is queryable via the Winston file logger
+   * (JSON with all fields preserved) AND visible on stdout/stderr where it
+   * matters. Hot-path events (`debug`) are file-only to avoid console flood.
+   */
+  private writeStructured(
+    level: StructuredLogLevel,
+    action: string,
+    ctx: Record<string, unknown>,
+  ): void {
+    const file = this.logger.getFileLogger();
+    const payload = { action, ...ctx };
+    switch (level) {
+      case 'debug':
+        file.debug(action, payload);
+        return;
+      case 'info':
+        this.logger.log(action, payload);
+        return;
+      case 'warn':
+        this.logger.warn(action, payload);
+        file.warn(action, payload);
+        return;
+      case 'error':
+        this.logger.error(action, payload);
+        file.error(action, payload);
+        return;
+    }
   }
 }

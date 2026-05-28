@@ -24,6 +24,8 @@ type ConsumerMock = {
   run: jest.Mock;
   commitOffsets: jest.Mock;
   seek: jest.Mock;
+  on: jest.Mock;
+  events: { CRASH: string };
   __triggerMessage?: (payload: {
     topic: string;
     partition: number;
@@ -33,6 +35,9 @@ type ConsumerMock = {
       headers?: Record<string, Buffer | string | null>;
     };
   }) => Promise<void>;
+  __triggerCrash?: (payload: {
+    payload: { error?: { message: string }; restart?: boolean };
+  }) => void;
 };
 type KafkaCtorArgs = {
   clientId?: string;
@@ -119,6 +124,19 @@ jest.mock('kafkajs', () => {
                 ),
               commitOffsets: jest.fn().mockResolvedValue(undefined),
               seek: jest.fn(),
+              events: { CRASH: 'consumer.crash' },
+              on: jest
+                .fn()
+                .mockImplementation(
+                  (
+                    eventName: string,
+                    listener: ConsumerMock['__triggerCrash'],
+                  ) => {
+                    if (eventName === 'consumer.crash') {
+                      c.__triggerCrash = listener;
+                    }
+                  },
+                ),
             };
             consumers.push(c);
             consumerGroupIds.push(groupId);
@@ -290,6 +308,50 @@ describe('KafkaBrokerAdapter', () => {
       );
       await close();
     });
+
+    it('ensures topic exists (idempotent) on first publish, skips admin call on subsequent publishes', async () => {
+      const { adapter, close } = await buildAdapter({
+        BROKER_TYPE: 'kafka',
+        KAFKA_BROKERS: 'localhost:9092',
+      });
+      await (
+        adapter as unknown as { onModuleInit: () => Promise<void> }
+      ).onModuleInit();
+
+      await adapter.publish('publish-only-topic', { x: 1 });
+      await adapter.publish('publish-only-topic', { x: 2 });
+      await adapter.publish('publish-only-topic', { x: 3 });
+
+      expect(lastKafka().admin.createTopics).toHaveBeenCalledTimes(1);
+      const call = (
+        lastKafka().admin.createTopics.mock.calls[0] as unknown[]
+      )[0] as CreateTopicsCall;
+      expect(call.topics[0].topic).toBe('publish-only-topic');
+      expect(lastKafka().producer.send).toHaveBeenCalledTimes(3);
+      await close();
+    });
+
+    it('treats "topic already exists" as success and caches it', async () => {
+      const { adapter, close } = await buildAdapter({
+        BROKER_TYPE: 'kafka',
+        KAFKA_BROKERS: 'localhost:9092',
+      });
+      await (
+        adapter as unknown as { onModuleInit: () => Promise<void> }
+      ).onModuleInit();
+
+      lastKafka().admin.createTopics.mockRejectedValueOnce(
+        new Error('Topic with this name already exists'),
+      );
+
+      await expect(
+        adapter.publish('shared-topic', { a: 1 }),
+      ).resolves.toBeUndefined();
+      // Second publish must NOT retry createTopics (cached as ensured).
+      await adapter.publish('shared-topic', { a: 2 });
+      expect(lastKafka().admin.createTopics).toHaveBeenCalledTimes(1);
+      await close();
+    });
   });
 
   describe('subscribe + ack + nack', () => {
@@ -409,6 +471,34 @@ describe('KafkaBrokerAdapter', () => {
       await close();
     });
 
+    it('nack(msg) without second argument defaults to requeue=true', async () => {
+      const { adapter, received, consumer, close } = await subscribeAndCapture({
+        BROKER_TYPE: 'kafka',
+        RUN_MODE: 'event-process',
+      });
+
+      await consumer.__triggerMessage!({
+        topic: 'events-topic',
+        partition: 4,
+        message: {
+          offset: '11',
+          value: Buffer.from(JSON.stringify({})),
+          headers: { correlationId: 'c', messageId: 'm' },
+        },
+      });
+
+      // No requeue argument → must behave like requeue=true.
+      await adapter.nack(received[0]);
+
+      expect(consumer.commitOffsets).not.toHaveBeenCalled();
+      expect(consumer.seek).toHaveBeenCalledWith({
+        topic: 'events-topic',
+        partition: 4,
+        offset: '11',
+      });
+      await close();
+    });
+
     it('nack(requeue=false) commits offset+1 and increments terminal_failure metric', async () => {
       const { adapter, metrics, received, consumer, close } =
         await subscribeAndCapture({
@@ -475,6 +565,30 @@ describe('KafkaBrokerAdapter', () => {
         broker: 'kafka',
         topic: 'events-topic',
       });
+      await close();
+    });
+
+    it('registers a consumer.crash handler that surfaces the event to logs', async () => {
+      const { consumer, close } = await subscribeAndCapture({
+        BROKER_TYPE: 'kafka',
+        RUN_MODE: 'event-process',
+      });
+
+      expect(consumer.on).toHaveBeenCalledWith(
+        'consumer.crash',
+        expect.any(Function),
+      );
+      expect(consumer.__triggerCrash).toBeDefined();
+
+      // Trigger crash event — must not throw, must be observable.
+      expect(() =>
+        consumer.__triggerCrash!({
+          payload: {
+            error: { message: 'broker disconnected' },
+            restart: false,
+          },
+        }),
+      ).not.toThrow();
       await close();
     });
   });
