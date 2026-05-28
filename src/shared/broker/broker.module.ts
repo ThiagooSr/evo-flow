@@ -8,11 +8,16 @@ import { BROKER_TYPE_VALUES, BrokerType } from './types/broker-type.enum';
 import { BrokerConfigError } from './errors/broker-config.error';
 import { KafkaBrokerAdapter } from './adapters/kafka-broker.adapter';
 import { RabbitMQBrokerAdapter } from './adapters/rabbitmq-broker.adapter';
+import { BrokerMetrics } from './metrics/broker-metrics';
 
 const brokerProvider: Provider = {
   provide: IMESSAGE_BROKER,
-  inject: [ConfigService],
-  useFactory: (config: ConfigService): IMessageBroker => {
+  inject: [ConfigService, KafkaBrokerAdapter, RabbitMQBrokerAdapter],
+  useFactory: (
+    config: ConfigService,
+    kafka: KafkaBrokerAdapter,
+    rabbit: RabbitMQBrokerAdapter,
+  ): IMessageBroker => {
     const rawValue = config.get<string>('BROKER_TYPE');
     const validList = BROKER_TYPE_VALUES.join(', ');
 
@@ -30,9 +35,9 @@ const brokerProvider: Provider = {
 
     switch (rawValue as BrokerType) {
       case BrokerType.KAFKA:
-        return new KafkaBrokerAdapter();
+        return kafka;
       case BrokerType.RABBITMQ:
-        return new RabbitMQBrokerAdapter();
+        return rabbit;
       default: {
         const _exhaustive: never = rawValue as never;
         throw new BrokerConfigError(
@@ -45,7 +50,12 @@ const brokerProvider: Provider = {
 
 @Global()
 @Module({
-  providers: [brokerProvider],
-  exports: [brokerProvider],
+  providers: [
+    BrokerMetrics,
+    KafkaBrokerAdapter,
+    RabbitMQBrokerAdapter,
+    brokerProvider,
+  ],
+  exports: [brokerProvider, BrokerMetrics],
 })
 export class BrokerModule {}
