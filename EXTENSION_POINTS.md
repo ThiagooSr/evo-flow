@@ -36,6 +36,25 @@ EvoExtensionPoints.replace('theme_tokens', myThemeTokensProvider);
 
 The default implementations are registered at process start. A consumer overrides them by calling `replace` before `NestFactory.create(AppModule)` resolves. After the application context is bootstrapped, replacements are rejected.
 
+### Bootstrap (zero-fork registration)
+
+The community runtime triggers consumer registration without any code change in this repository, via the `EVO_EXTENSIONS_BOOTSTRAP` environment variable. When set to a module specifier, the runtime imports that module at process start (before the module graph is built) and calls its exported `register(registry)` function, passing the live `EvoExtensionPoints` singleton:
+
+```ts
+// the consumer package (e.g. an enterprise overlay) exports:
+export function register(registry: typeof EvoExtensionPoints): void {
+  registry.replace('runtime_context', myEnricher);
+  registry.replace('plugin_loader', () => ({ modules: [MyModule] }));
+}
+```
+
+```bash
+# enable the consumer (e.g. in the deployment image):
+EVO_EXTENSIONS_BOOTSTRAP=@my-org/my-extension-package
+```
+
+When the variable is unset — the default OSS / standalone case — nothing is loaded and the no-op defaults stand. The registry instance is passed in so the consumer mutates the same singleton the runtime reads. `plugin_loader` modules returned by the registered factory are imported into `AppModule` at boot; `runtime_context` is applied per request by the globally-mounted `RuntimeContextMiddleware`.
+
 ---
 
 ## Extension points

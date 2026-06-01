@@ -1,4 +1,9 @@
-import { MiddlewareConsumer, Module, DynamicModule } from '@nestjs/common';
+import {
+  MiddlewareConsumer,
+  Module,
+  DynamicModule,
+  Type,
+} from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
 import { TypeOrmModule } from '@nestjs/typeorm';
 import { ScheduleModule } from '@nestjs/schedule';
@@ -27,6 +32,10 @@ import { CrmClientModule } from './shared/crm-client/crm-client.module';
 import { AuthClientModule } from './shared/auth-client/auth-client.module';
 import { BrokerModule } from './shared/broker/broker.module';
 import { AppFactory } from './app-factory';
+import {
+  EvoExtensionPoints,
+  RuntimeContextMiddleware,
+} from './evo-extension-points';
 
 /**
  * Dynamic App Module - Imports modules based on RUN_MODE
@@ -65,14 +74,23 @@ export class AppModule {
       BrokerModule,
     ];
 
-    const conditionalImports: any[] = [];
+    const conditionalImports: Array<DynamicModule | Type> = [];
     if (AppFactory.shouldStartTemporalWorker()) {
       conditionalImports.push(TemporalModule);
     }
 
+    // Extension point (story 0.15): external consumers — e.g. an enterprise
+    // overlay — register NestJS modules through the plugin_loader seam. The
+    // community default returns no modules, so this is empty in standalone OSS
+    // runs. Consumed synchronously to keep forRoot() sync; the runtime contract
+    // also permits async factories, which are not consumed here.
+    const pluginResult = EvoExtensionPoints.get('plugin_loader')();
+    const pluginModules: DynamicModule[] =
+      pluginResult instanceof Promise ? [] : pluginResult.modules;
+
     return {
       module: AppModule,
-      imports: [...baseImports, ...conditionalImports],
+      imports: [...baseImports, ...pluginModules, ...conditionalImports],
       controllers: [AppController, MetricsController],
       providers: [
         BootstrapService,
@@ -89,5 +107,9 @@ export class AppModule {
     // Single-account: AccountMiddleware removed. Replaced by lightweight
     // RequestContextMiddleware (transactionId/ip/userAgent only).
     consumer.apply(RequestContextMiddleware).forRoutes('*');
+    // Extension point (story 0.15, wiring deferred to 10.1): build the
+    // request-scoped runtime context and hand it to the registered enricher.
+    // Community default leaves scope_id null; an enterprise overlay fills it.
+    consumer.apply(RuntimeContextMiddleware).forRoutes('*');
   }
 }

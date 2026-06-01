@@ -34,3 +34,5 @@ export { PLUGIN_LOADER_OPTIONS } from './plugin-loader/plugin-loader.types';
 
 export { ThemeTokensService } from './theme-tokens/theme-tokens.service';
 export { ThemeTokensModule } from './theme-tokens/theme-tokens.module';
+
+export { loadExternalExtensions } from './load-external-extensions';
