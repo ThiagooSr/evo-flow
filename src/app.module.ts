@@ -3,6 +3,7 @@ import {
   Module,
   DynamicModule,
   Type,
+  Logger,
 } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
 import { TypeOrmModule } from '@nestjs/typeorm';
@@ -82,11 +83,22 @@ export class AppModule {
     // Extension point (story 0.15): external consumers — e.g. an enterprise
     // overlay — register NestJS modules through the plugin_loader seam. The
     // community default returns no modules, so this is empty in standalone OSS
-    // runs. Consumed synchronously to keep forRoot() sync; the runtime contract
-    // also permits async factories, which are not consumed here.
+    // runs. Consumed synchronously to keep forRoot() sync (async factories are
+    // warned about below, not awaited).
     const pluginResult = EvoExtensionPoints.get('plugin_loader')();
-    const pluginModules: DynamicModule[] =
-      pluginResult instanceof Promise ? [] : pluginResult.modules;
+    let pluginModules: DynamicModule[] = [];
+    if (pluginResult instanceof Promise) {
+      // forRoot() is synchronous and cannot await here. The runtime contract
+      // permits an async plugin_loader factory, but this consumption path does
+      // not support one — surface it loudly instead of silently dropping its
+      // modules (which would look like "the overlay didn't load" with no clue).
+      new Logger('AppModule').warn(
+        'plugin_loader returned a Promise (async factory); its modules were ' +
+          'NOT imported. Use a synchronous factory, or await it before forRoot().',
+      );
+    } else {
+      pluginModules = pluginResult.modules;
+    }
 
     return {
       module: AppModule,
