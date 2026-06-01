@@ -1,4 +1,10 @@
-import { MiddlewareConsumer, Module, DynamicModule } from '@nestjs/common';
+import {
+  MiddlewareConsumer,
+  Module,
+  DynamicModule,
+  Type,
+  Logger,
+} from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
 import { TypeOrmModule } from '@nestjs/typeorm';
 import { ScheduleModule } from '@nestjs/schedule';
@@ -27,6 +33,10 @@ import { CrmClientModule } from './shared/crm-client/crm-client.module';
 import { AuthClientModule } from './shared/auth-client/auth-client.module';
 import { BrokerModule } from './shared/broker/broker.module';
 import { AppFactory } from './app-factory';
+import {
+  EvoExtensionPoints,
+  RuntimeContextMiddleware,
+} from './evo-extension-points';
 
 /**
  * Dynamic App Module - Imports modules based on RUN_MODE
@@ -65,14 +75,34 @@ export class AppModule {
       BrokerModule,
     ];
 
-    const conditionalImports: any[] = [];
+    const conditionalImports: Array<DynamicModule | Type> = [];
     if (AppFactory.shouldStartTemporalWorker()) {
       conditionalImports.push(TemporalModule);
     }
 
+    // Extension point (story 0.15): external consumers — e.g. an enterprise
+    // overlay — register NestJS modules through the plugin_loader seam. The
+    // community default returns no modules, so this is empty in standalone OSS
+    // runs. Consumed synchronously to keep forRoot() sync (async factories are
+    // warned about below, not awaited).
+    const pluginResult = EvoExtensionPoints.get('plugin_loader')();
+    let pluginModules: DynamicModule[] = [];
+    if (pluginResult instanceof Promise) {
+      // forRoot() is synchronous and cannot await here. The runtime contract
+      // permits an async plugin_loader factory, but this consumption path does
+      // not support one — surface it loudly instead of silently dropping its
+      // modules (which would look like "the overlay didn't load" with no clue).
+      new Logger('AppModule').warn(
+        'plugin_loader returned a Promise (async factory); its modules were ' +
+          'NOT imported. Use a synchronous factory, or await it before forRoot().',
+      );
+    } else {
+      pluginModules = pluginResult.modules;
+    }
+
     return {
       module: AppModule,
-      imports: [...baseImports, ...conditionalImports],
+      imports: [...baseImports, ...pluginModules, ...conditionalImports],
       controllers: [AppController, MetricsController],
       providers: [
         BootstrapService,
@@ -89,5 +119,9 @@ export class AppModule {
     // Single-account: AccountMiddleware removed. Replaced by lightweight
     // RequestContextMiddleware (transactionId/ip/userAgent only).
     consumer.apply(RequestContextMiddleware).forRoutes('*');
+    // Extension point (story 0.15, wiring deferred to 10.1): build the
+    // request-scoped runtime context and hand it to the registered enricher.
+    // Community default leaves scope_id null; an enterprise overlay fills it.
+    consumer.apply(RuntimeContextMiddleware).forRoutes('*');
   }
 }

@@ -23,7 +23,6 @@ export { CapabilityGateGuard } from './capability-gate/capability-gate.guard';
 export { CapabilityGateModule } from './capability-gate/capability-gate.module';
 
 export { RuntimeContextMiddleware } from './runtime-context/runtime-context.middleware';
-export { RuntimeContextModule } from './runtime-context/runtime-context.module';
 export {
   RUNTIME_CONTEXT,
   RUNTIME_CONTEXT_REQUEST_KEY,
@@ -34,3 +33,5 @@ export { PLUGIN_LOADER_OPTIONS } from './plugin-loader/plugin-loader.types';
 
 export { ThemeTokensService } from './theme-tokens/theme-tokens.service';
 export { ThemeTokensModule } from './theme-tokens/theme-tokens.module';
+
+export { loadExternalExtensions } from './load-external-extensions';

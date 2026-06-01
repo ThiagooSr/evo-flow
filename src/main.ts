@@ -88,6 +88,7 @@ import { SchedulerRegistry } from '@nestjs/schedule';
 import { DataSource } from 'typeorm';
 import { AppModule } from './app.module';
 import { CustomLoggerService } from './common/services/custom-logger.service';
+import { loadExternalExtensions } from './evo-extension-points';
 
 async function bootstrap() {
   // 🔍 DEBUG: Log environment variables BEFORE anything else
@@ -104,6 +105,11 @@ async function bootstrap() {
 
   // Use original Logger interface for bootstrap, but with custom logger underneath
   const logger = new Logger('Bootstrap');
+
+  // Register external extension-point implementations (e.g. an enterprise
+  // overlay) before the module graph is built and before the first request.
+  // No-op when EVO_EXTENSIONS_BOOTSTRAP is unset (standalone OSS run).
+  await loadExternalExtensions();
 
   // Determine which module to load based on RUN_MODE
   // Filter log levels - disable DEBUG and VERBOSE for cleaner output
