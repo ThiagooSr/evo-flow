@@ -164,4 +164,60 @@ describeMaybe('tenant isolation (RLS) — concurrent (10.1b AC1/AC2)', () => {
     // turns this silent-empty into an explicit throw at the app layer).
     expect(rows).toEqual([]);
   });
+
+  // Write path — the tenant_id column DEFAULT from the GUC (EVO-1612). The
+  // community Journey entity has NO tenant_id field, so `save({ name })` never
+  // supplies the column; the DB DEFAULT populates it from app.current_tenant_id.
+  describe('write path (tenant_id DEFAULT from GUC — EVO-1612)', () => {
+    it('CREATE under a tenant context auto-populates tenant_id and stays isolated', async () => {
+      const created = await withTenant(TENANT_A, (m) =>
+        m.getRepository(Journey).save({ name: 'write-A-1' }),
+      );
+      seeded.push(created.id);
+
+      const aSees = await withTenant(TENANT_A, (m) =>
+        m.getRepository(Journey).find({ where: { name: 'write-A-1' } }),
+      );
+      const bSees = await withTenant(TENANT_B, (m) =>
+        m.getRepository(Journey).find({ where: { name: 'write-A-1' } }),
+      );
+      expect(aSees).toHaveLength(1); // the creating tenant sees its row
+      expect(bSees).toHaveLength(0); // the other tenant never does
+    });
+
+    it('concurrent CREATEs from two tenants never cross', async () => {
+      const [a, b] = await Promise.all([
+        withTenant(TENANT_A, (m) =>
+          m.getRepository(Journey).save({ name: 'cc-A' }),
+        ),
+        withTenant(TENANT_B, (m) =>
+          m.getRepository(Journey).save({ name: 'cc-B' }),
+        ),
+      ]);
+      seeded.push(a.id, b.id);
+
+      const aNames = (
+        await withTenant(TENANT_A, (m) => m.getRepository(Journey).find())
+      ).map((j) => j.name);
+      const bNames = (
+        await withTenant(TENANT_B, (m) => m.getRepository(Journey).find())
+      ).map((j) => j.name);
+
+      expect(aNames).toContain('cc-A');
+      expect(aNames).not.toContain('cc-B');
+      expect(bNames).toContain('cc-B');
+      expect(bNames).not.toContain('cc-A');
+    });
+
+    it('CREATE with no tenant context fails, never writes unscoped', async () => {
+      // No GUC → the DEFAULT resolves to NULL (NOT NULL violation) and the RLS
+      // WITH CHECK also fails; either way the INSERT is rejected, never written
+      // unscoped. (Which of the two fires first is a DB detail, not asserted.)
+      await expect(
+        withTenant(null, (m) =>
+          m.getRepository(Journey).save({ name: 'orphan' }),
+        ),
+      ).rejects.toThrow();
+    });
+  });
 });
