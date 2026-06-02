@@ -212,12 +212,14 @@ describeMaybe('tenant isolation (RLS) — concurrent (10.1b AC1/AC2)', () => {
     it('CREATE with no tenant context fails, never writes unscoped', async () => {
       // No GUC → the DEFAULT resolves to NULL (NOT NULL violation) and the RLS
       // WITH CHECK also fails; either way the INSERT is rejected, never written
-      // unscoped. (Which of the two fires first is a DB detail, not asserted.)
+      // unscoped. (Which of the two fires first is a DB detail, not asserted —
+      // but we DO assert the rejection is the isolation guard, not some
+      // unrelated failure that would falsely pass a bare `toThrow()`.)
       await expect(
         withTenant(null, (m) =>
           m.getRepository(Journey).save({ name: 'orphan' }),
         ),
-      ).rejects.toThrow();
+      ).rejects.toThrow(/null value|not-null|violates|row-level security/i);
     });
   });
 });
