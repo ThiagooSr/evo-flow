@@ -1,8 +1,8 @@
 import { Injectable, Logger } from '@nestjs/common';
-import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { Campaign } from '../entities/campaign.entity';
 import { CampaignContact } from '../entities/campaign-contact.entity';
+import { TenantDbContext } from '../../../evo-extension-points';
 import { SegmentComputationService } from '../../segments/services/segment-computation.service';
 import { SegmentQueryBuilderService } from './segment-query-builder.service';
 import { ContactsClientService } from '../../../shared/crm-client/contacts-client.service';
@@ -41,14 +41,19 @@ export class AudienceComputationService {
   private readonly logger = new Logger(AudienceComputationService.name);
 
   constructor(
-    @InjectRepository(Campaign)
-    private readonly campaignRepository: Repository<Campaign>,
-    @InjectRepository(CampaignContact)
-    private readonly campaignContactRepository: Repository<CampaignContact>,
+    private readonly db: TenantDbContext,
     private readonly segmentQueryBuilder: SegmentQueryBuilderService,
     private readonly segmentComputationService: SegmentComputationService,
     private readonly contactsClient: ContactsClientService,
   ) {}
+
+  private get campaignRepository(): Repository<Campaign> {
+    return this.db.getRepository(Campaign);
+  }
+
+  private get campaignContactRepository(): Repository<CampaignContact> {
+    return this.db.getRepository(CampaignContact);
+  }
 
   /**
    * Main method to compute and populate campaign audience
@@ -73,9 +78,8 @@ export class AudienceComputationService {
     await this.clearAudience(campaignId);
 
     // Determine segmentation strategy
-    const query = await this.segmentQueryBuilder.analyzeSegmentationStrategy(
-      campaign,
-    );
+    const query =
+      await this.segmentQueryBuilder.analyzeSegmentationStrategy(campaign);
 
     this.logger.log(
       `Using segmentation strategy: ${query.type} for campaign ${campaignId}`,
@@ -176,9 +180,7 @@ export class AudienceComputationService {
     contactIds: string[],
   ): Promise<{ validContacts: number; invalidContacts: number }> {
     if (contactIds.length === 0) {
-      this.logger.warn(
-        `No contacts to populate for campaign ${campaign.id}`,
-      );
+      this.logger.warn(`No contacts to populate for campaign ${campaign.id}`);
       return { validContacts: 0, invalidContacts: 0 };
     }
 
@@ -314,9 +316,8 @@ export class AudienceComputationService {
       throw new Error(`Campaign ${campaignId} not found`);
     }
 
-    const query = await this.segmentQueryBuilder.analyzeSegmentationStrategy(
-      campaign,
-    );
+    const query =
+      await this.segmentQueryBuilder.analyzeSegmentationStrategy(campaign);
 
     let estimated = 0;
 

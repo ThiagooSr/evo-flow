@@ -1,10 +1,10 @@
 import { Injectable, Logger } from '@nestjs/common';
-import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import Redis from 'ioredis';
 import { Campaign } from '../entities/campaign.entity';
 import { CampaignContact } from '../entities/campaign-contact.entity';
 import { MessageTemplate } from '../../../shared/entities/message-template.entity';
+import { TenantDbContext } from '../../../evo-extension-points';
 import { ConfigService } from '@nestjs/config';
 import { ContactsClientService } from '../../../shared/crm-client/contacts-client.service';
 import {
@@ -60,19 +60,12 @@ export class CampaignMessageSenderService {
   private readonly timeout: number = 30000; // 30 seconds
 
   // Rate limiting trackers (in-memory, could be moved to Redis for distributed systems)
-  private rateLimiters: Map<
-    string,
-    { count: number; windowStart: number }
-  > = new Map();
+  private rateLimiters: Map<string, { count: number; windowStart: number }> =
+    new Map();
   private redis: Redis | null = null;
 
   constructor(
-    @InjectRepository(Campaign)
-    private readonly campaignRepository: Repository<Campaign>,
-    @InjectRepository(CampaignContact)
-    private readonly campaignContactRepository: Repository<CampaignContact>,
-    @InjectRepository(MessageTemplate)
-    private readonly messageTemplateRepository: Repository<MessageTemplate>,
+    private readonly db: TenantDbContext,
     private readonly configService: ConfigService,
     private readonly contactsClient: ContactsClientService,
   ) {
@@ -85,6 +78,18 @@ export class CampaignMessageSenderService {
     if (!this.serviceToken) {
       this.logger.warn('EVOAI_CRM_API_TOKEN not configured');
     }
+  }
+
+  private get campaignRepository(): Repository<Campaign> {
+    return this.db.getRepository(Campaign);
+  }
+
+  private get campaignContactRepository(): Repository<CampaignContact> {
+    return this.db.getRepository(CampaignContact);
+  }
+
+  private get messageTemplateRepository(): Repository<MessageTemplate> {
+    return this.db.getRepository(MessageTemplate);
   }
 
   private async getRedisClient(): Promise<Redis | null> {
@@ -154,9 +159,7 @@ export class CampaignMessageSenderService {
         campaign.isRateLimit &&
         !(await this.checkRateLimit(rateLimitKey, input.channelType))
       ) {
-        throw new Error(
-          `Rate limit exceeded for channel ${input.channelType}`,
-        );
+        throw new Error(`Rate limit exceeded for channel ${input.channelType}`);
       }
 
       // Get message content (from template or campaign)
@@ -424,10 +427,13 @@ export class CampaignMessageSenderService {
           const retryAfter = response.headers.get('Retry-After');
           const waitTime = retryAfter ? parseInt(retryAfter) * 1000 : 5000;
 
-          this.logger.warn(`Rate limited by CRM API, retrying in ${waitTime}ms`, {
-            attempt,
-            maxRetries,
-          });
+          this.logger.warn(
+            `Rate limited by CRM API, retrying in ${waitTime}ms`,
+            {
+              attempt,
+              maxRetries,
+            },
+          );
 
           await new Promise((resolve) => setTimeout(resolve, waitTime));
           continue;
@@ -466,10 +472,7 @@ export class CampaignMessageSenderService {
   /**
    * Get rate limit key for tracking
    */
-  private getRateLimitKey(
-    inboxId: string,
-    channelType: string,
-  ): string {
+  private getRateLimitKey(inboxId: string, channelType: string): string {
     return `rate:${inboxId}:${channelType}`;
   }
 

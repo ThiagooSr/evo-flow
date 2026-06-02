@@ -11,6 +11,13 @@ export interface InitializeJourneySessionInput {
   journeyId: string;
   contactId: string;
   workflowId?: string; // The Temporal workflow ID for this session
+  /**
+   * Tenant the journey workflow belongs to (ADR14, story 10.1b). Propagated from
+   * the workflow payload so tenant-scoped activity DB access can be wrapped via
+   * `runActivityInTenantDbContext`. Optional during the single-tenant phase
+   * (resolves to DEFAULT_TENANT_ID); required for multi-tenant go-live.
+   */
+  tenantId?: string | null;
   triggerEvent?: {
     messageId: string;
     eventName: string;

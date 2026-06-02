@@ -36,6 +36,7 @@ import { AppFactory } from './app-factory';
 import {
   EvoExtensionPoints,
   RuntimeContextMiddleware,
+  TenantDbContextModule,
 } from './evo-extension-points';
 
 /**
@@ -70,6 +71,9 @@ export class AppModule {
           mount: false,
         },
       }),
+      // DB-context seam (ADR14, story 10.1b). Global no-op provider in community;
+      // the enterprise overlay contributes the per-request RLS transaction.
+      TenantDbContextModule,
       CrmClientModule,
       AuthClientModule,
       BrokerModule,

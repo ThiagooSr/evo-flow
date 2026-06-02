@@ -4,11 +4,11 @@ import {
   ConflictException,
   UnprocessableEntityException,
 } from '@nestjs/common';
-import { InjectRepository } from '@nestjs/typeorm';
 import { Repository, SelectQueryBuilder } from 'typeorm';
 import { EventEmitter2 } from '@nestjs/event-emitter';
 import { randomUUID } from 'crypto';
 import { Segment, SegmentDefinition } from './entities/segment.entity';
+import { TenantDbContext } from '../../evo-extension-points';
 import { CustomLoggerService } from 'src/common/services/custom-logger.service';
 import { CreateSegmentDto } from './dto/create-segment.dto';
 import { UpdateSegmentDto } from './dto/update-segment.dto';
@@ -30,13 +30,16 @@ export class SegmentsService {
   private readonly logger = new CustomLoggerService(SegmentsService.name);
 
   constructor(
-    @InjectRepository(Segment)
-    private segmentRepository: Repository<Segment>,
+    private readonly db: TenantDbContext,
     private segmentComputationService: SegmentComputationService,
     private modularSegmentComputationService: ModularSegmentComputationService,
     private segmentCacheService: SegmentCacheService,
     private eventEmitter: EventEmitter2,
   ) {}
+
+  private get segmentRepository(): Repository<Segment> {
+    return this.db.getRepository(Segment);
+  }
 
   async create(
     createSegmentDto: CreateSegmentDto,

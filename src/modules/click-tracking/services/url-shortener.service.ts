@@ -1,9 +1,9 @@
 import { Injectable } from '@nestjs/common';
-import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { nanoid, customAlphabet } from 'nanoid';
 import { ShortLink } from '../entities/short-link.entity';
 import { CustomLoggerService } from 'src/common/services/custom-logger.service';
+import { TenantDbContext } from '../../../evo-extension-points';
 
 @Injectable()
 export class UrlShortenerService {
@@ -21,10 +21,11 @@ export class UrlShortenerService {
     this.shortCodeLength,
   );
 
-  constructor(
-    @InjectRepository(ShortLink)
-    private shortLinkRepository: Repository<ShortLink>,
-  ) {}
+  constructor(private readonly db: TenantDbContext) {}
+
+  private get shortLinkRepository(): Repository<ShortLink> {
+    return this.db.getRepository(ShortLink);
+  }
 
   /**
    * Generate a unique short code
@@ -51,7 +52,9 @@ export class UrlShortenerService {
       const code = this.customNanoid();
 
       if (await this.isCodeAvailable(code)) {
-        this.logger.debug(`Generated short code: ${code} (attempt ${attempts + 1})`);
+        this.logger.debug(
+          `Generated short code: ${code} (attempt ${attempts + 1})`,
+        );
         return code;
       }
 

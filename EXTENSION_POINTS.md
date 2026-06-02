@@ -1,6 +1,6 @@
 # Evo Flow — Extension Points
 
-**Contract version:** `1.0.0`
+**Contract version:** `1.1.0`
 **Stack:** NestJS 11 + TypeScript + TypeORM + BullMQ + Temporal
 
 Evo Flow is the automation engine of the Evo CRM Community family. It powers journeys, segments, campaigns, events, and click-tracking. This document declares the **public extension points** that the runtime exposes so external consumers can compose, replace, or extend behavior without forking the codebase.
@@ -30,6 +30,7 @@ EvoExtensionPoints.replace('capability_gate', myCapabilityGateImplementation);
 EvoExtensionPoints.replace('runtime_context', myRuntimeContextEnricher);
 EvoExtensionPoints.replace('plugin_loader', myPluginLoaderConfig);
 EvoExtensionPoints.replace('theme_tokens', myThemeTokensProvider);
+EvoExtensionPoints.replace('tenant_db_context', myTenantDbContextRunner);
 ```
 
 `EvoExtensionPoints.replace(name, impl)` validates the shape of `impl` at registration time and throws if the contract is violated. The registry refuses to replace an unknown extension point name; the set of valid names is frozen on the version declared at the top of this document.
@@ -216,6 +217,60 @@ EvoExtensionPoints.replace('theme_tokens', async (scope_id) => {
 
 ---
 
+### 5. `tenant_db_context`
+
+**Version:** `1.0.0` (added in contract `1.1.0`)
+**Default:** no-op passthrough — runs the work on the global pool `EntityManager`, no transaction, no session config. Single-tenant / OSS behavior is unchanged.
+
+```ts
+type TenantDbContextImpl = <T>(
+  dataSource: DataSource,
+  tenantId: string | null,
+  work: (manager: EntityManager) => Promise<T>,
+) => Promise<T>;
+```
+
+The DB-context seam (ADR14). Tenant-scoped services resolve their `Repository`/`EntityManager` through the `TenantDbContext` provider rather than the global pool, so every query against a tenant-scoped table runs on a connection that carries the tenant's row-level-security context. The runtime stays ignorant of tenancy: it passes the already-resolved `tenantId` (from `runtime_context`) and its own `DataSource`; the impl decides whether to open a transaction, apply `SELECT set_config('app.current_tenant_id', $1, true)`, or reject a missing context.
+
+Usage in a tenant-scoped service:
+
+```ts
+@Injectable()
+export class JourneysService {
+  constructor(private readonly db: TenantDbContext) {}
+
+  findAll() {
+    // Lands on the connection carrying app.current_tenant_id when an overlay is
+    // active; on the global pool manager otherwise (community / single-tenant).
+    return this.db.getRepository(Journey).find();
+  }
+}
+```
+
+Override (enterprise overlay — per-request transaction + RLS GUC):
+
+```ts
+EvoExtensionPoints.replace('tenant_db_context', (dataSource, tenantId, work) => {
+  if (multiTenantEnabled && !tenantId) {
+    // Fail explicitly — never run a tenant-scoped query with no context (which
+    // RLS would silently return as zero rows).
+    throw new TenantContextMissingError();
+  }
+  return dataSource.transaction(async (manager) => {
+    await manager.query(`SELECT set_config('app.current_tenant_id', $1, true)`, [
+      tenantId,
+    ]);
+    return work(manager);
+  });
+});
+```
+
+The HTTP path wraps the whole request handler in this through a per-request interceptor; **Temporal activities** reapply it via `runInTenantDbContext(dataSource, tenantId, work)`, reading `tenantId` from the workflow/activity payload. Community standalone never registers an override, so both paths run on the global pool unchanged.
+
+**Breaking-change policy:** changing the signature (parameter order/types) or the contract that the impl receives an already-resolved `tenantId` is a major bump. The community default never opens a transaction, so OSS consumers see no behavior change.
+
+---
+
 ## How to use as a consumer
 
 The example below assembles a hypothetical consumer that registers all four hooks. It does not import or reference any private code; everything it needs is in this document and in the community runtime.
@@ -281,4 +336,5 @@ The runtime never auto-downloads, auto-updates, or executes remote plugins witho
 
 ## Versioning history
 
+- **`1.1.0`** — Adds `tenant_db_context` (ADR14, story 10.1b): the DB-context seam that scopes tenant queries to an RLS-aware connection. Additive minor bump — the default is a no-op passthrough, so existing consumers are unaffected.
 - **`1.0.0`** — Initial release of the contract. Declares `capability_gate`, `runtime_context`, `plugin_loader`, and `theme_tokens` as the four supported extension points.

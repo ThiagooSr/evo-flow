@@ -1,5 +1,6 @@
 import type { Request } from 'express';
 import type { DynamicModule } from '@nestjs/common';
+import type { DataSource, EntityManager } from 'typeorm';
 import { ExtensionPointName } from './version';
 
 export type CapabilityGateImpl = (
@@ -42,11 +43,32 @@ export type ThemeTokensImpl = (
   scopeId: string | null,
 ) => Promise<ThemeTokens> | ThemeTokens;
 
+/**
+ * DB-context seam (ADR14, story 10.1b). Runs `work` against an `EntityManager`
+ * that is guaranteed to carry the tenant's RLS context. The community default is
+ * a no-op passthrough to the global pool manager (single-tenant / OSS parity); an
+ * enterprise overlay replaces it with a per-request transaction on a dedicated
+ * connection that applies `SELECT set_config('app.current_tenant_id', $1, true)`
+ * so Postgres RLS policies filter every query on that connection.
+ *
+ * The runtime never knows about tenant resolution: it passes the already-resolved
+ * `tenantId` (from `runtime_context`, story 10.1) and its own `DataSource`. The
+ * impl decides whether to open a transaction, set the GUC, or reject a missing
+ * context. Used by both the HTTP path (via the `TenantDbContext` provider) and
+ * Temporal activities (which pass `tenantId` from the workflow payload).
+ */
+export type TenantDbContextImpl = <T>(
+  dataSource: DataSource,
+  tenantId: string | null,
+  work: (manager: EntityManager) => Promise<T>,
+) => Promise<T>;
+
 export interface ExtensionPointImplementations {
   capability_gate: CapabilityGateImpl;
   runtime_context: RuntimeContextImpl;
   plugin_loader: PluginLoaderImpl;
   theme_tokens: ThemeTokensImpl;
+  tenant_db_context: TenantDbContextImpl;
 }
 
 const defaultCapabilityGate: CapabilityGateImpl = () => true;
@@ -58,12 +80,21 @@ const defaultPluginLoader: PluginLoaderImpl = () => ({ modules: [] });
 
 const defaultThemeTokens: ThemeTokensImpl = () => ({});
 
+// No-op passthrough: run the work on the global pool manager, no transaction, no
+// GUC. Preserves single-tenant / OSS behavior exactly (community is untouched).
+const defaultTenantDbContext: TenantDbContextImpl = (
+  dataSource,
+  _tenantId,
+  work,
+) => work(dataSource.manager);
+
 class ExtensionPointRegistry {
   private readonly implementations: ExtensionPointImplementations = {
     capability_gate: defaultCapabilityGate,
     runtime_context: defaultRuntimeContext,
     plugin_loader: defaultPluginLoader,
     theme_tokens: defaultThemeTokens,
+    tenant_db_context: defaultTenantDbContext,
   };
 
   replace<K extends ExtensionPointName>(
@@ -90,6 +121,7 @@ class ExtensionPointRegistry {
     this.implementations.runtime_context = defaultRuntimeContext;
     this.implementations.plugin_loader = defaultPluginLoader;
     this.implementations.theme_tokens = defaultThemeTokens;
+    this.implementations.tenant_db_context = defaultTenantDbContext;
   }
 }
 

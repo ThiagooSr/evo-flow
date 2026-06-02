@@ -5,6 +5,7 @@ import { AudienceComputationService } from '../../campaigns/services/audience-co
 import { CampaignsService } from '../../campaigns/services/campaigns.service';
 import { Campaign } from '../../campaigns/entities/campaign.entity';
 import { CampaignExecution } from '../../campaigns/entities/campaign-execution.entity';
+import { runActivityInTenantDbContext } from '../tenant-activity-context';
 
 let appContext: any = null;
 
@@ -71,6 +72,13 @@ export interface GetCampaignDataInput {
 export interface UpdateExecutionProgressInput {
   campaignId: string;
   workflowId: string;
+  /**
+   * Tenant the workflow belongs to (ADR14, story 10.1b). Propagated from the
+   * workflow payload so the activity's DB write is scoped by RLS. Optional for
+   * single-tenant (resolves to DEFAULT_TENANT_ID); under multi-tenant a missing
+   * value makes the activity fail explicitly rather than run unscoped.
+   */
+  tenantId?: string | null;
   status?: 'running' | 'paused' | 'completed' | 'failed' | 'cancelled';
   totalContacts?: number;
   processedContacts?: number;
@@ -372,9 +380,6 @@ export async function updateExecutionProgress(
   input: UpdateExecutionProgressInput,
 ): Promise<void> {
   try {
-    const app = await getAppContext();
-    const dataSource = app.get('DataSource');
-
     const updates: Record<string, any> = {};
     if (input.status !== undefined) updates.status = input.status;
     if (input.totalContacts !== undefined) updates.totalContacts = input.totalContacts;
@@ -388,12 +393,19 @@ export async function updateExecutionProgress(
       updates.endedAt = new Date();
     }
 
-    await dataSource.getRepository(CampaignExecution).update(
-      {
-        campaignId: input.campaignId,
-        workflowId: input.workflowId,
-      },
-      updates,
+    // Reference wiring (ADR14, story 10.1b): scope the activity's DB write to the
+    // workflow's tenant via the seam. Uses the handed EntityManager so the UPDATE
+    // runs on the connection carrying app.current_tenant_id (enterprise), or the
+    // global pool (community / single-tenant). A missing tenant under multi-tenant
+    // throws here instead of writing across tenants.
+    await runActivityInTenantDbContext(input.tenantId, (manager) =>
+      manager.getRepository(CampaignExecution).update(
+        {
+          campaignId: input.campaignId,
+          workflowId: input.workflowId,
+        },
+        updates,
+      ),
     );
   } catch (error) {
     log.error('Failed to update campaign execution progress', {
