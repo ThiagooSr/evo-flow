@@ -765,6 +765,8 @@ export async function JourneyExecutionWorkflow(
             nodeResult = await actionNodeActivities.executeConditionalNode({
               nodeId: currentNode.id,
               contactId: input.contactId,
+              conversationId:
+                input.triggerEvent?.properties?.conversation_id || undefined,
               sessionId: input.sessionId,
               nodeData: currentNode.data,
             });
