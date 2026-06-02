@@ -12,6 +12,7 @@ export {
   PluginLoaderImpl,
   ThemeTokens,
   ThemeTokensImpl,
+  TenantDbContextImpl,
   ExtensionPointImplementations,
 } from './registry';
 
@@ -33,5 +34,12 @@ export { PLUGIN_LOADER_OPTIONS } from './plugin-loader/plugin-loader.types';
 
 export { ThemeTokensService } from './theme-tokens/theme-tokens.service';
 export { ThemeTokensModule } from './theme-tokens/theme-tokens.module';
+
+export {
+  TenantDbContext,
+  runInTenantDbContext,
+} from './tenant-db-context/tenant-db-context.service';
+export { TenantDbContextModule } from './tenant-db-context/tenant-db-context.module';
+export { TENANT_DB_MANAGER_CLS_KEY } from './tenant-db-context/tenant-db-context.types';
 
 export { loadExternalExtensions } from './load-external-extensions';

@@ -35,6 +35,25 @@ describe('EvoExtensionPoints registry', () => {
       const result = await tokens(null);
       expect(result).toEqual({});
     });
+
+    it('tenant_db_context default runs work on the global pool manager, no txn', async () => {
+      const runner = EvoExtensionPoints.get('tenant_db_context');
+      const globalManager = { id: 'global' };
+      const transaction = jest.fn();
+      const dataSource = { manager: globalManager, transaction } as never;
+
+      const seen: unknown[] = [];
+      const result = await runner(dataSource, 'tenant-A', async (manager) => {
+        seen.push(manager);
+        return 'ok';
+      });
+
+      expect(result).toBe('ok');
+      // No-op passthrough: the work ran on the global manager and no transaction
+      // was opened (OSS / single-tenant parity).
+      expect(seen).toEqual([globalManager]);
+      expect(transaction).not.toHaveBeenCalled();
+    });
   });
 
   describe('replace', () => {

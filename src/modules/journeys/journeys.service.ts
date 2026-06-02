@@ -3,7 +3,6 @@ import {
   NotFoundException,
   BadRequestException,
 } from '@nestjs/common';
-import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { Journey } from './entities/journey.entity';
 import { CreateJourneyDto, UpdateJourneyDto } from './dto';
@@ -11,6 +10,7 @@ import { ProcessingService } from '../processing/processing.service';
 import { EventData } from '../processing/interfaces/event-data.interface';
 import { CustomLoggerService } from '../../common/services/custom-logger.service';
 import { JourneyCacheService } from '../cache/services/journey-cache.service';
+import { TenantDbContext } from '../../evo-extension-points';
 import { v4 as uuidv4 } from 'uuid';
 
 @Injectable()
@@ -18,12 +18,21 @@ export class JourneysService {
   private readonly logger: CustomLoggerService;
 
   constructor(
-    @InjectRepository(Journey)
-    private readonly journeyRepository: Repository<Journey>,
+    private readonly db: TenantDbContext,
     private readonly processingService: ProcessingService,
     private readonly journeyCacheService: JourneyCacheService,
   ) {
     this.logger = new CustomLoggerService(JourneysService.name);
+  }
+
+  /**
+   * Tenant-scoped `journeys` repository (ADR14, story 10.1b). Resolved through
+   * the DB-context seam on every access so queries land on the connection
+   * carrying `app.current_tenant_id`; falls back to the global pool manager in
+   * community / single-tenant. Replaces the former `@InjectRepository(Journey)`.
+   */
+  private get journeyRepository(): Repository<Journey> {
+    return this.db.getRepository(Journey);
   }
 
   async create(createJourneyDto: CreateJourneyDto): Promise<Journey> {
