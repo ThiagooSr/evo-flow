@@ -90,6 +90,25 @@ const ALLOWLIST = new Map([
   ['src/modules/temporal/activities/utils/variable-interpolation.util.ts', 'Temporal propagation staged'],
 ]);
 
+/**
+ * Every allowlist entry is known tenant-isolation debt that must SHRINK toward
+ * go-live (ADR14 consequence). This ratchet fails the build if the list grows
+ * past its recorded size, so a new global-pool bypass cannot be quietly
+ * allowlisted in. Lower the ceiling whenever an entry is removed; raising it
+ * requires a deliberate, justified edit in the PR.
+ */
+const ALLOWLIST_CEILING = 23;
+if (ALLOWLIST.size > ALLOWLIST_CEILING) {
+  console.error(
+    `\n✖ tenant-db-context guard: ALLOWLIST grew to ${ALLOWLIST.size} entries ` +
+      `(ceiling ${ALLOWLIST_CEILING}).\n` +
+      `  The allowlist is tenant-isolation debt and must only shrink. Migrate the new\n` +
+      `  file to the TenantDbContext seam instead of allowlisting it; if it is genuinely\n` +
+      `  deferred, raise ALLOWLIST_CEILING in this script with justification in the PR.\n`,
+  );
+  process.exit(1);
+}
+
 function walk(dir) {
   const out = [];
   for (const name of readdirSync(dir)) {

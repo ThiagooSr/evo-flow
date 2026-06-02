@@ -60,9 +60,13 @@ export class TenantDbContext {
    * resulting `EntityManager` in CLS for the duration of `work`, so nested
    * `getManager()`/`getRepository()` calls hit the same connection.
    *
-   * The HTTP path wraps the whole request handler in this (enterprise
-   * interceptor). The enterprise impl is responsible for rejecting a missing
-   * tenant when multi-tenant is enabled (AC3 — fail explicitly, never leak).
+   * Convenience wrapper for callers that have a NestJS/CLS context and want to
+   * scope a block of `work` themselves. NOTE: the HTTP request path does NOT go
+   * through here — the enterprise `TenantTransactionInterceptor` runs the same
+   * runner directly and publishes the manager into CLS, so this method is
+   * currently unused at runtime (kept as part of the seam's public surface). The
+   * enterprise impl is responsible for rejecting a missing tenant when
+   * multi-tenant is enabled (AC3 — fail explicitly, never leak).
    */
   async runWithTenant<T>(
     tenantId: string | null,
