@@ -1,9 +1,9 @@
 import { Injectable } from '@nestjs/common';
 import { ClickHouseService } from '../../processing/clickhouse/clickhouse.service';
 import { SegmentQueueService } from './segment-queue.service';
-import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { Segment } from '../entities/segment.entity';
+import { TenantDbContext } from '../../../evo-extension-points';
 import { CustomLoggerService } from 'src/common/services/custom-logger.service';
 
 export interface SegmentInvalidationResult {
@@ -25,9 +25,12 @@ export class SegmentInvalidationService {
   constructor(
     private readonly clickhouseService: ClickHouseService,
     private readonly segmentQueueService: SegmentQueueService,
-    @InjectRepository(Segment)
-    private readonly segmentRepository: Repository<Segment>,
+    private readonly db: TenantDbContext,
   ) {}
+
+  private get segmentRepository(): Repository<Segment> {
+    return this.db.getRepository(Segment);
+  }
 
   /**
    * Check if a segment definition references a specific event

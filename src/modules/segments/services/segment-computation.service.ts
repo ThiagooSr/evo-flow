@@ -1,8 +1,8 @@
 import { Injectable, Optional } from '@nestjs/common';
-import { InjectRepository } from '@nestjs/typeorm';
 import { Repository, IsNull, Not } from 'typeorm';
 import { EventEmitter2 } from '@nestjs/event-emitter';
 import { Segment } from '../entities/segment.entity';
+import { TenantDbContext } from '../../../evo-extension-points';
 import { ModularSegmentComputationService } from './modular-segment-computation.service';
 import { ClickHouseService } from '../../processing/clickhouse/clickhouse.service';
 import { SegmentDistributedJobService } from './segment-distributed-job.service';
@@ -24,14 +24,17 @@ export class SegmentComputationService {
   );
 
   constructor(
-    @InjectRepository(Segment)
-    private segmentRepository: Repository<Segment>,
+    private readonly db: TenantDbContext,
     private modularComputationService: ModularSegmentComputationService,
     private clickhouseService: ClickHouseService,
     private segmentCacheService: SegmentCacheService,
     private eventEmitter: EventEmitter2,
     @Optional() private distributedJobService?: SegmentDistributedJobService,
   ) {}
+
+  private get segmentRepository(): Repository<Segment> {
+    return this.db.getRepository(Segment);
+  }
 
   private isDistributedProcessingEnabled(): boolean {
     return process.env.ENABLE_DISTRIBUTED_PROCESSING === 'true';

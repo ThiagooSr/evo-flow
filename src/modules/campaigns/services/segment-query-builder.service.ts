@@ -1,9 +1,9 @@
 import { Injectable } from '@nestjs/common';
-import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { Campaign } from '../entities/campaign.entity';
 import { Segment } from '../../segments/entities/segment.entity';
 import { Tagging, TaggableType } from '../../labels/entities/tagging.entity';
+import { TenantDbContext } from '../../../evo-extension-points';
 import { ContactsClientService } from '../../../shared/crm-client/contacts-client.service';
 import type { HydratedContact } from '../../../shared/crm-client/types/contact';
 
@@ -39,12 +39,17 @@ export interface AudienceQueryResult {
 @Injectable()
 export class SegmentQueryBuilderService {
   constructor(
-    @InjectRepository(Segment)
-    private readonly segmentRepository: Repository<Segment>,
-    @InjectRepository(Tagging)
-    private readonly taggingRepository: Repository<Tagging>,
+    private readonly db: TenantDbContext,
     private readonly contactsClient: ContactsClientService,
   ) {}
+
+  private get segmentRepository(): Repository<Segment> {
+    return this.db.getRepository(Segment);
+  }
+
+  private get taggingRepository(): Repository<Tagging> {
+    return this.db.getRepository(Tagging);
+  }
 
   /**
    * Analyze campaign definition and determine the best query strategy

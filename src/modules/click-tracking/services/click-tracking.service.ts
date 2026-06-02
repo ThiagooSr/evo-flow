@@ -4,12 +4,16 @@ import {
   BadRequestException,
   ConflictException,
 } from '@nestjs/common';
-import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { EventEmitter2 } from '@nestjs/event-emitter';
 import { ShortLink } from '../entities/short-link.entity';
 import { LinkParameter } from '../entities/link-parameter.entity';
-import { CreateShortLinkDto, UpdateShortLinkDto, BulkCreateLinksDto } from '../dto';
+import { TenantDbContext } from '../../../evo-extension-points';
+import {
+  CreateShortLinkDto,
+  UpdateShortLinkDto,
+  BulkCreateLinksDto,
+} from '../dto';
 import { UrlShortenerService } from './url-shortener.service';
 import { LinkCacheService } from 'src/modules/cache/services/link-cache.service';
 import { CustomLoggerService } from 'src/common/services/custom-logger.service';
@@ -22,21 +26,24 @@ import { CustomDomainsService } from './custom-domains.service';
  */
 @Injectable()
 export class ClickTrackingService {
-  private readonly logger = new CustomLoggerService(
-    ClickTrackingService.name,
-  );
+  private readonly logger = new CustomLoggerService(ClickTrackingService.name);
 
   constructor(
-    @InjectRepository(ShortLink)
-    private readonly shortLinkRepository: Repository<ShortLink>,
-    @InjectRepository(LinkParameter)
-    private readonly linkParameterRepository: Repository<LinkParameter>,
+    private readonly db: TenantDbContext,
     private readonly urlShortenerService: UrlShortenerService,
     private readonly linkCacheService: LinkCacheService,
     private readonly eventEmitter: EventEmitter2,
     private readonly clickHouseService: ClickHouseService,
     private readonly customDomainsService: CustomDomainsService,
   ) {}
+
+  private get shortLinkRepository(): Repository<ShortLink> {
+    return this.db.getRepository(ShortLink);
+  }
+
+  private get linkParameterRepository(): Repository<LinkParameter> {
+    return this.db.getRepository(LinkParameter);
+  }
 
   /**
    * Create a new short link
@@ -176,7 +183,9 @@ export class ClickTrackingService {
         throw error;
       }
 
-      throw new BadRequestException(`Failed to create short link: ${error.message}`);
+      throw new BadRequestException(
+        `Failed to create short link: ${error.message}`,
+      );
     }
   }
 
@@ -318,7 +327,9 @@ export class ClickTrackingService {
     try {
       const qb = this.clickHouseService.createQueryBuilder();
       qb.addQueryPart('SELECT');
-      qb.addQueryPart('JSONExtractString(properties, \'short_link_id\') as short_link_id,');
+      qb.addQueryPart(
+        "JSONExtractString(properties, 'short_link_id') as short_link_id,",
+      );
       qb.addQueryPart('COUNT(*) as click_count,');
       qb.addQueryPart('COUNT(DISTINCT contact_id) as unique_click_count');
       qb.addQueryPart('FROM contact_events');
@@ -337,7 +348,10 @@ export class ClickTrackingService {
       });
 
       // Create a map of link_id -> counts
-      const clickCountsMap = new Map<string, { clickCount: number; uniqueClickCount: number }>();
+      const clickCountsMap = new Map<
+        string,
+        { clickCount: number; uniqueClickCount: number }
+      >();
       for (const result of clickHouseResults) {
         clickCountsMap.set(result.short_link_id, {
           clickCount: result.click_count,
@@ -360,7 +374,9 @@ export class ClickTrackingService {
             link.shortUrl = `https://${link.customDomain.domain}/`;
           }
         } else {
-          link.shortUrl = this.urlShortenerService.buildShortUrl(link.shortCode);
+          link.shortUrl = this.urlShortenerService.buildShortUrl(
+            link.shortCode,
+          );
         }
       }
 
@@ -381,7 +397,9 @@ export class ClickTrackingService {
             link.shortUrl = `https://${link.customDomain.domain}/`;
           }
         } else {
-          link.shortUrl = this.urlShortenerService.buildShortUrl(link.shortCode);
+          link.shortUrl = this.urlShortenerService.buildShortUrl(
+            link.shortCode,
+          );
         }
       }
     }
@@ -487,8 +505,12 @@ export class ClickTrackingService {
       // Query ClickHouse for click counts grouped by short_link_id
       const qb = this.clickHouseService.createQueryBuilder();
       qb.addQueryPart('SELECT');
-      qb.addQueryPart('JSONExtractString(properties, \'short_link_id\') as short_link_id,');
-      qb.addQueryPart('JSONExtractString(properties, \'short_code\') as short_code,');
+      qb.addQueryPart(
+        "JSONExtractString(properties, 'short_link_id') as short_link_id,",
+      );
+      qb.addQueryPart(
+        "JSONExtractString(properties, 'short_code') as short_code,",
+      );
       qb.addQueryPart('COUNT(*) as click_count,');
       qb.addQueryPart('COUNT(DISTINCT contact_id) as unique_click_count');
       qb.addQueryPart('FROM contact_events');
@@ -514,7 +536,10 @@ export class ClickTrackingService {
       );
 
       // Create a map of short_link_id -> counts
-      const clickCountsMap = new Map<string, { clickCount: number; uniqueClickCount: number }>();
+      const clickCountsMap = new Map<
+        string,
+        { clickCount: number; uniqueClickCount: number }
+      >();
       for (const result of clickHouseResults) {
         clickCountsMap.set(result.short_link_id, {
           clickCount: result.click_count,
@@ -536,7 +561,10 @@ export class ClickTrackingService {
             `Link ${link.shortCode}: DB=${link.clickCount}/${link.uniqueClickCount}, ClickHouse=${clickCount}/${uniqueClickCount}`,
           );
 
-          if (clickCount !== link.clickCount || uniqueClickCount !== link.uniqueClickCount) {
+          if (
+            clickCount !== link.clickCount ||
+            uniqueClickCount !== link.uniqueClickCount
+          ) {
             await this.shortLinkRepository.update(link.id, {
               clickCount,
               uniqueClickCount,

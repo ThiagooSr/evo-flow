@@ -4,17 +4,22 @@ import {
   BadRequestException,
   ConflictException,
 } from '@nestjs/common';
-import { InjectRepository } from '@nestjs/typeorm';
 import { Repository, In } from 'typeorm';
-import { Campaign, CampaignStatus, CampaignType } from '../entities/campaign.entity';
+import {
+  Campaign,
+  CampaignStatus,
+  CampaignType,
+} from '../entities/campaign.entity';
 import { CreateCampaignDto, UpdateCampaignDto, CampaignQueryDto } from '../dto';
+import { TenantDbContext } from '../../../evo-extension-points';
 
 @Injectable()
 export class CampaignsService {
-  constructor(
-    @InjectRepository(Campaign)
-    private readonly campaignRepository: Repository<Campaign>,
-  ) {}
+  constructor(private readonly db: TenantDbContext) {}
+
+  private get campaignRepository(): Repository<Campaign> {
+    return this.db.getRepository(Campaign);
+  }
 
   async create(createCampaignDto: CreateCampaignDto): Promise<Campaign> {
     // Check for duplicate name
@@ -32,15 +37,22 @@ export class CampaignsService {
       ...createCampaignDto,
       status: CampaignStatus.DRAFT,
       type: createCampaignDto.type || CampaignType.SIMPLE,
-      phoneNumberStrategy: createCampaignDto.phoneNumberStrategy || 'round_robin',
-      templateAllocationConfig: createCampaignDto.templateAllocationConfig || {},
+      phoneNumberStrategy:
+        createCampaignDto.phoneNumberStrategy || 'round_robin',
+      templateAllocationConfig:
+        createCampaignDto.templateAllocationConfig || {},
       deliveryDistribution: createCampaignDto.deliveryDistribution || {},
     });
 
     return this.campaignRepository.save(campaign);
   }
 
-  async findAll(queryDto?: CampaignQueryDto): Promise<{ campaigns: Campaign[]; total: number; page: number; pageSize: number }> {
+  async findAll(queryDto?: CampaignQueryDto): Promise<{
+    campaigns: Campaign[];
+    total: number;
+    page: number;
+    pageSize: number;
+  }> {
     const {
       page = 1,
       per_page = 25,
@@ -67,22 +79,28 @@ export class CampaignsService {
     }
 
     if (channel_type && channel_type.length > 0) {
-      queryBuilder.andWhere('campaign.channelType IN (:...channelType)', { channelType: channel_type });
+      queryBuilder.andWhere('campaign.channelType IN (:...channelType)', {
+        channelType: channel_type,
+      });
     }
 
     // Apply search
     if (search) {
       queryBuilder.andWhere(
         '(campaign.title ILIKE :search OR campaign.name ILIKE :search)',
-        { search: `%${search}%` }
+        { search: `%${search}%` },
       );
     }
 
     // Apply sorting
-    const sortField = sort === 'created_at' ? 'campaign.createdAt' :
-                      sort === 'schedule_to' ? 'campaign.scheduleTo' :
-                      sort === 'name' ? 'campaign.name' :
-                      'campaign.status';
+    const sortField =
+      sort === 'created_at'
+        ? 'campaign.createdAt'
+        : sort === 'schedule_to'
+          ? 'campaign.scheduleTo'
+          : sort === 'name'
+            ? 'campaign.name'
+            : 'campaign.status';
 
     queryBuilder.orderBy(sortField, order.toUpperCase() as 'ASC' | 'DESC');
 
@@ -290,7 +308,8 @@ export class CampaignsService {
     const totalRead = Math.floor(totalDelivered * 0.7);
     const totalErrors = totalSent - totalDelivered;
     const deliveryRate = totalSent > 0 ? (totalDelivered / totalSent) * 100 : 0;
-    const readRate = totalDelivered > 0 ? (totalRead / totalDelivered) * 100 : 0;
+    const readRate =
+      totalDelivered > 0 ? (totalRead / totalDelivered) * 100 : 0;
 
     return {
       total_sent: totalSent,
@@ -302,7 +321,10 @@ export class CampaignsService {
     };
   }
 
-  private validateStatusTransition(currentStatus: CampaignStatus, newStatus: CampaignStatus): void {
+  private validateStatusTransition(
+    currentStatus: CampaignStatus,
+    newStatus: CampaignStatus,
+  ): void {
     const validTransitions: Record<CampaignStatus, CampaignStatus[]> = {
       [CampaignStatus.DRAFT]: [
         CampaignStatus.SCHEDULED,

@@ -1,14 +1,16 @@
 import { SegmentQueryBuilderService } from './segment-query-builder.service';
+import { Segment } from '../../segments/entities/segment.entity';
+import { TenantDbContext } from '../../../evo-extension-points';
 
 describe('SegmentQueryBuilderService', () => {
   const segmentRepository: any = {};
   const taggingRepository: any = {};
+  const db = {
+    getRepository: (entity: unknown) =>
+      entity === Segment ? segmentRepository : taggingRepository,
+  } as unknown as TenantDbContext;
   const contactsClient: any = {};
-  const service = new SegmentQueryBuilderService(
-    segmentRepository,
-    taggingRepository,
-    contactsClient,
-  );
+  const service = new SegmentQueryBuilderService(db, contactsClient);
 
   it('uses triggerConfig.segment_id as segment strategy', async () => {
     const campaign: any = {
@@ -57,4 +59,3 @@ describe('SegmentQueryBuilderService', () => {
     });
   });
 });
-

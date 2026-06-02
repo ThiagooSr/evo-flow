@@ -4,10 +4,10 @@ import {
   BadRequestException,
   ConflictException,
 } from '@nestjs/common';
-import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { EventEmitter2 } from '@nestjs/event-emitter';
 import { CustomDomain } from '../entities/custom-domain.entity';
+import { TenantDbContext } from '../../../evo-extension-points';
 import { CustomLoggerService } from 'src/common/services/custom-logger.service';
 import { randomBytes } from 'crypto';
 import * as dns from 'dns';
@@ -22,23 +22,21 @@ const resolveCname = promisify(dns.resolveCname);
  */
 @Injectable()
 export class CustomDomainsService {
-  private readonly logger = new CustomLoggerService(
-    CustomDomainsService.name,
-  );
+  private readonly logger = new CustomLoggerService(CustomDomainsService.name);
 
   constructor(
-    @InjectRepository(CustomDomain)
-    private readonly customDomainRepository: Repository<CustomDomain>,
+    private readonly db: TenantDbContext,
     private readonly eventEmitter: EventEmitter2,
   ) {}
+
+  private get customDomainRepository(): Repository<CustomDomain> {
+    return this.db.getRepository(CustomDomain);
+  }
 
   /**
    * Create a new custom domain
    */
-  async create(
-    domain: string,
-    targetCname?: string,
-  ): Promise<CustomDomain> {
+  async create(domain: string, targetCname?: string): Promise<CustomDomain> {
     try {
       // Validate domain format
       if (!this.isValidDomain(domain)) {
@@ -77,9 +75,7 @@ export class CustomDomainsService {
         domain,
         verificationToken,
         targetCname:
-          targetCname ||
-          process.env.SHORT_URL_BASE_DOMAIN ||
-          defaultCname,
+          targetCname || process.env.SHORT_URL_BASE_DOMAIN || defaultCname,
         isVerified: false,
         isActive: false, // Only active after verification
       });
@@ -174,7 +170,9 @@ export class CustomDomainsService {
         `DNS verification failed for ${domain.domain}: ${error.message}`,
         error.stack,
       );
-      throw new BadRequestException(`DNS verification failed: ${error.message}`);
+      throw new BadRequestException(
+        `DNS verification failed: ${error.message}`,
+      );
     }
   }
 
@@ -186,8 +184,8 @@ export class CustomDomainsService {
       const txtRecords = await resolveTxt(`_evo-verify.${domain.domain}`);
       const flatRecords = txtRecords.flat();
 
-      const found = flatRecords.some(record =>
-        record.includes(domain.verificationToken)
+      const found = flatRecords.some((record) =>
+        record.includes(domain.verificationToken),
       );
 
       this.logger.log(
@@ -210,10 +208,11 @@ export class CustomDomainsService {
     try {
       const cnameRecords = await resolveCname(domain.domain);
 
-      const found = cnameRecords.some(record =>
-        record.includes(domain.targetCname) ||
-        record.includes('evo.link') ||
-        record.includes('localhost') // For development
+      const found = cnameRecords.some(
+        (record) =>
+          record.includes(domain.targetCname) ||
+          record.includes('evo.link') ||
+          record.includes('localhost'), // For development
       );
 
       this.logger.log(
@@ -300,10 +299,7 @@ export class CustomDomainsService {
   /**
    * Update custom domain
    */
-  async update(
-    id: string,
-    data: Partial<CustomDomain>,
-  ): Promise<CustomDomain> {
+  async update(id: string, data: Partial<CustomDomain>): Promise<CustomDomain> {
     const domain = await this.findById(id);
 
     // Update allowed fields
@@ -355,7 +351,8 @@ export class CustomDomainsService {
    * Validate domain format
    */
   private isValidDomain(domain: string): boolean {
-    const domainRegex = /^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9][a-z0-9-]{0,61}[a-z0-9]$/i;
+    const domainRegex =
+      /^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9][a-z0-9-]{0,61}[a-z0-9]$/i;
     return domainRegex.test(domain);
   }
 

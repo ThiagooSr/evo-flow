@@ -1,10 +1,10 @@
 import { Injectable } from '@nestjs/common';
-import { InjectRepository } from '@nestjs/typeorm';
 import { In, Repository } from 'typeorm';
 import {
   CampaignExecution,
   CampaignExecutionStatus,
 } from '../entities/campaign-execution.entity';
+import { TenantDbContext } from '../../../evo-extension-points';
 
 const ACTIVE_STATUSES = [
   CampaignExecutionStatus.RUNNING,
@@ -13,10 +13,11 @@ const ACTIVE_STATUSES = [
 
 @Injectable()
 export class CampaignExecutionsService {
-  constructor(
-    @InjectRepository(CampaignExecution)
-    private readonly executionsRepository: Repository<CampaignExecution>,
-  ) {}
+  constructor(private readonly db: TenantDbContext) {}
+
+  private get executionsRepository(): Repository<CampaignExecution> {
+    return this.db.getRepository(CampaignExecution);
+  }
 
   async createExecution(input: {
     campaignId: string;
