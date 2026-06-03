@@ -358,6 +358,32 @@ const ENTRIES: EventCatalogEntry[] = [
     },
   },
   {
+    eventName: 'pipeline.stage_changed',
+    category: 'campaign',
+    dtoType: 'track',
+    labelPt: 'Stage do pipeline alterado',
+    labelEn: 'Pipeline stage changed',
+    description: 'A conversation/contact moved between stages in a pipeline.',
+    schema: {
+      required: {
+        pipeline_id: f('uuid'),
+        pipeline_stage_id: f('uuid', 'Destination stage'),
+        source: f('string'),
+      },
+      optional: {
+        pipeline_name: f('string'),
+        pipeline_stage_name: f('string'),
+        from_stage_id: f('uuid'),
+        from_stage_name: f('string'),
+        to_stage_id: f('uuid'),
+        to_stage_name: f('string'),
+        pipeline_item_id: f('uuid'),
+        conversation_id: f('uuid'),
+        contact_id: f('uuid'),
+      },
+    },
+  },
+  {
     eventName: 'custom',
     category: 'custom',
     dtoType: 'track',
