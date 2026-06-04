@@ -28,32 +28,40 @@ export class WebhooksController {
 
   @Post('*splat')
   async receive(@Req() req: RawRequest, @Res() res: Response): Promise<void> {
-    const platform = this.extractPlatform(req);
+    const pathSegment = this.extractPathSegment(req);
     const contentType = String(req.headers['content-type'] ?? '');
     const rawBody = Buffer.isBuffer(req.body) ? req.body : req.rawBody;
 
-    let parsed: unknown;
     try {
-      parsed = this.parsePayload(rawBody, contentType);
+      // Parse only to reject malformed payloads (400). The broker envelope
+      // carries the raw body, not the parsed shape, so the result is discarded.
+      this.parsePayload(rawBody, contentType);
     } catch {
       this.logger.warn(
-        `Rejected malformed webhook payload (platform=${platform}, content-type=${contentType})`,
+        `Rejected malformed webhook payload (path=${pathSegment}, content-type=${contentType})`,
         LOG_CONTEXT,
       );
       res.status(400).json({ error: 'malformed_payload' });
       return;
     }
 
+    // The resolved platform + target topic are logged by WebhookIntakeService;
+    // here we only know the raw request path, not the detector's verdict.
     this.logger.log(
-      `Webhook received (platform=${platform}, bytes=${rawBody?.length ?? 0})`,
+      `Webhook received (path=${pathSegment}, bytes=${rawBody?.length ?? 0})`,
       LOG_CONTEXT,
     );
 
     try {
-      await this.intake.intake({ platform, contentType, rawBody, parsed });
+      await this.intake.intake({
+        pathSegment,
+        rawBody,
+        headers: req.headers,
+        sourceIp: this.extractSourceIp(req),
+      });
     } catch (error) {
       this.logger.error(
-        `Webhook intake failed (platform=${platform}): ${
+        `Webhook intake failed (path=${pathSegment}): ${
           error instanceof Error ? error.message : String(error)
         }`,
         LOG_CONTEXT,
@@ -68,7 +76,29 @@ export class WebhooksController {
     res.status(200).json({ ok: true });
   }
 
-  private extractPlatform(req: RawRequest): string {
+  private extractSourceIp(req: RawRequest): string {
+    // Respect reverse-proxy headers (NGINX, ALB, Cloudflare) before falling
+    // back to the socket — the receiver sits behind a proxy in every deploy.
+    const forwardedFor = req.headers['x-forwarded-for'];
+    if (forwardedFor) {
+      const first = Array.isArray(forwardedFor)
+        ? forwardedFor[0]
+        : forwardedFor.split(',')[0];
+      return first.trim();
+    }
+
+    const realIp = req.headers['x-real-ip'];
+    if (realIp) return Array.isArray(realIp) ? realIp[0] : realIp;
+
+    const cfConnectingIp = req.headers['cf-connecting-ip'];
+    if (cfConnectingIp) {
+      return Array.isArray(cfConnectingIp) ? cfConnectingIp[0] : cfConnectingIp;
+    }
+
+    return req.ip || req.socket?.remoteAddress || 'unknown';
+  }
+
+  private extractPathSegment(req: RawRequest): string {
     // Express 5 / path-to-regexp v8 exposes the `*splat` wildcard capture as an
     // array of path segments.
     const splat = (req.params as Record<string, string | string[]>)?.['splat'];
