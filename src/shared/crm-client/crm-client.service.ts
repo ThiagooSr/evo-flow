@@ -726,6 +726,48 @@ export class CrmClientService {
     );
   }
 
+  async getCannedResponse(cannedResponseId: string): Promise<CrmApiResponse<any>> {
+    const url = `${this.baseURL}/api/v1/canned_responses/${cannedResponseId}`;
+    return this.executeRequest(
+      url,
+      { method: 'GET' },
+      { nodeType: 'get-canned-response', conversationId: 'n/a' },
+    );
+  }
+
+  async addToPipeline(
+    pipelineId: string,
+    conversationId: string,
+    stageId?: string,
+    nodeType: string = 'assign-to-pipeline',
+  ): Promise<CrmApiResponse<any>> {
+    const url = `${this.baseURL}/api/v1/pipelines/${pipelineId}/pipeline_items`;
+    const body: Record<string, unknown> = {
+      item_id: conversationId,
+      type: 'conversation',
+    };
+    if (stageId) body.pipeline_stage_id = stageId;
+    return this.executeRequest(
+      url,
+      { method: 'POST', body: JSON.stringify(body) },
+      { nodeType, conversationId },
+    );
+  }
+
+  async sendEmailTeam(
+    context: CrmConversationContext,
+    teamIds: string[],
+    message: string,
+    nodeType: string = 'send-email-team',
+  ): Promise<CrmApiResponse<any>> {
+    const url = `${this.getConversationURL(context.conversationId)}/email_team`;
+    return this.executeRequest(
+      url,
+      { method: 'POST', body: JSON.stringify({ team_ids: teamIds, message }) },
+      { nodeType, conversationId: context.conversationId },
+    );
+  }
+
   async createScheduledAction(
     contactId: string,
     actionType: string,

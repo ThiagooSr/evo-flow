@@ -26,6 +26,9 @@ import {
   TriggerNodeInput,
 } from './nodes';
 import { SendMessageNode, SendMessageNodeInput } from './nodes/evoai/communication/send-message.node';
+import { SendCannedResponseNode, SendCannedResponseNodeInput } from './nodes/evoai/communication/send-canned-response.node';
+import { SendEmailTeamNode, SendEmailTeamNodeInput } from './nodes/evoai/communication/send-email-team.node';
+import { AssignToPipelineNode, AssignToPipelineNodeInput } from './nodes/evoai/pipeline/assign-to-pipeline.node';
 import { SendTranscriptNode, SendTranscriptNodeInput } from './nodes/evoai/communication/send-transcript.node';
 import { AssignAgentNode, AssignAgentNodeInput } from './nodes/evoai/assignment/assign-agent.node';
 import { AssignTeamNode, AssignTeamNodeInput } from './nodes/evoai/assignment/assign-team.node';
@@ -60,6 +63,9 @@ export {
   MuteConversationNodeInput,
   ResolveConversationNodeInput,
   SnoozeConversationNodeInput,
+  SendCannedResponseNodeInput,
+  SendEmailTeamNodeInput,
+  AssignToPipelineNodeInput,
   ChangePriorityNodeInput,
   ScheduledActionNodeInput,
 };
@@ -96,6 +102,15 @@ export interface ActionNodeActivities {
   executeTriggerNode(input: TriggerNodeInput): Promise<NodeExecutionResult>;
   executeSendMessageNode(
     input: SendMessageNodeInput,
+  ): Promise<NodeExecutionResult>;
+  executeSendCannedResponseNode(
+    input: SendCannedResponseNodeInput,
+  ): Promise<NodeExecutionResult>;
+  executeSendEmailTeamNode(
+    input: SendEmailTeamNodeInput,
+  ): Promise<NodeExecutionResult>;
+  executeAssignToPipelineNode(
+    input: AssignToPipelineNodeInput,
   ): Promise<NodeExecutionResult>;
   executeSendTranscriptNode(
     input: SendTranscriptNodeInput,
@@ -146,6 +161,9 @@ let sendWebhookNode: SendWebhookNode;
 let conditionalNode: ConditionalNode;
 let triggerNode: TriggerNode;
 let sendMessageNode: SendMessageNode;
+let sendCannedResponseNode: SendCannedResponseNode;
+let sendEmailTeamNode: SendEmailTeamNode;
+let assignToPipelineNode: AssignToPipelineNode;
 let sendTranscriptNode: SendTranscriptNode;
 let assignAgentNode: AssignAgentNode;
 let assignTeamNode: AssignTeamNode;
@@ -215,6 +233,23 @@ function getTriggerNode() {
 function getSendMessageNode() {
   if (!sendMessageNode) sendMessageNode = new SendMessageNode();
   return sendMessageNode;
+}
+
+function getSendCannedResponseNode() {
+  if (!sendCannedResponseNode)
+    sendCannedResponseNode = new SendCannedResponseNode();
+  return sendCannedResponseNode;
+}
+
+function getSendEmailTeamNode() {
+  if (!sendEmailTeamNode) sendEmailTeamNode = new SendEmailTeamNode();
+  return sendEmailTeamNode;
+}
+
+function getAssignToPipelineNode() {
+  if (!assignToPipelineNode)
+    assignToPipelineNode = new AssignToPipelineNode();
+  return assignToPipelineNode;
 }
 
 function getSendTranscriptNode() {
@@ -406,6 +441,24 @@ export const actionNodeActivities: ActionNodeActivities = {
     input: SendMessageNodeInput,
   ): Promise<NodeExecutionResult> {
     return await getSendMessageNode().execute(input);
+  },
+
+  async executeSendCannedResponseNode(
+    input: SendCannedResponseNodeInput,
+  ): Promise<NodeExecutionResult> {
+    return await getSendCannedResponseNode().execute(input);
+  },
+
+  async executeSendEmailTeamNode(
+    input: SendEmailTeamNodeInput,
+  ): Promise<NodeExecutionResult> {
+    return await getSendEmailTeamNode().execute(input);
+  },
+
+  async executeAssignToPipelineNode(
+    input: AssignToPipelineNodeInput,
+  ): Promise<NodeExecutionResult> {
+    return await getAssignToPipelineNode().execute(input);
   },
 
   async executeSendTranscriptNode(
