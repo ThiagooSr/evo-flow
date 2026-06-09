@@ -333,6 +333,33 @@ describe('RabbitMQBrokerAdapter', () => {
       await close();
     });
 
+    it('provisionTopic declares the exchange + durable queue but does NOT bind it', async () => {
+      const { adapter, close } = await buildAdapter({
+        BROKER_TYPE: 'rabbitmq',
+        RABBITMQ_URL: 'amqp://admin:admin@rabbit:5672',
+      });
+      await (
+        adapter as unknown as { onModuleInit: () => Promise<void> }
+      ).onModuleInit();
+
+      await adapter.provisionTopic('campaigns.pack');
+
+      const ch = lastConn().channel;
+      expect(ch.assertExchange).toHaveBeenCalledWith(
+        'campaigns.pack',
+        'topic',
+        {
+          durable: true,
+        },
+      );
+      expect(ch.assertQueue).toHaveBeenCalledWith('campaigns.pack', {
+        durable: true,
+      });
+      // Unbound on purpose: a bound default queue would accumulate copies.
+      expect(ch.bindQueue).not.toHaveBeenCalled();
+      await close();
+    });
+
     it('throws when called before onModuleInit (dormant adapter)', async () => {
       const { adapter, close } = await buildAdapter({
         BROKER_TYPE: 'kafka',

@@ -187,6 +187,16 @@ export class RabbitMQBrokerAdapter
     });
   }
 
+  async provisionTopic(topic: string): Promise<void> {
+    this.assertActive('provisionTopic');
+    await this.ensureExchange(topic);
+    // Declare the durable queue but do NOT bind it. A bound, never-drained
+    // default queue would accumulate a copy of every message — the real
+    // consumer uses its own `${runMode}-${topic}` queue and binds it on
+    // subscribe. Provisioning only guarantees the exchange + queue exist.
+    await this.channel!.assertQueue(topic, { durable: true });
+  }
+
   async ack(msg: BrokerMessage): Promise<void> {
     const handle = this.pendingAcks.get(msg);
     if (!handle) {
