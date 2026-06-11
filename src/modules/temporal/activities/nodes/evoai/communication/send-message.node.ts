@@ -13,6 +13,19 @@ interface CrmMessageTemplate {
   variables?: Array<{ name?: string; default_value?: string }>;
 }
 
+// EVO-1267: source mapping for one template variable. Root sources become
+// {{root.path}} strings resolved by the CRM against the live conversation
+// (TemplateVariableResolver); 'fixed' is a literal; 'expression' is a
+// template string that may mix several {{root.path}} placeholders.
+export interface TemplateVariableMapping {
+  variable: string;
+  source: 'contact' | 'conversation' | 'pipeline' | 'fixed' | 'expression';
+  path?: string;
+  value?: string;
+  expression?: string;
+  fallback?: string;
+}
+
 export interface SendMessageNodeInput {
   nodeId: string;
   conversationId?: string; // Optional - will create new conversation if not provided
@@ -33,6 +46,9 @@ export interface SendMessageNodeInput {
     templateName?: string;
     templateLanguage?: string;
     templateParams?: Record<string, string>;
+    // Variable source mappings (EVO-1267); takes precedence over the plain
+    // templateParams value for the same variable name.
+    templateVariables?: TemplateVariableMapping[];
   };
 }
 
@@ -125,6 +141,47 @@ export class SendMessageNode extends BaseNode {
         (template) => String(template.id) === templateId,
       ) ?? null
     );
+  }
+
+  // EVO-1267: folds variable source mappings into the processed_params dict.
+  // Root sources and expressions stay as {{root.path}} strings — the CRM
+  // resolves them against the conversation, where contact/conversation/
+  // pipeline data actually lives. Fixed values are literals.
+  private buildVariableParams(
+    nodeData: SendMessageNodeInput['nodeData'],
+  ): { params: Record<string, string>; fallbacks: Record<string, string> } {
+    const params: Record<string, string> = {
+      ...(nodeData.templateParams ?? {}),
+    };
+    const fallbacks: Record<string, string> = {};
+
+    for (const mapping of nodeData.templateVariables ?? []) {
+      if (!mapping?.variable) continue;
+
+      switch (mapping.source) {
+        case 'fixed':
+          params[mapping.variable] = mapping.value ?? '';
+          break;
+        case 'expression':
+          params[mapping.variable] = mapping.expression ?? '';
+          break;
+        case 'contact':
+        case 'conversation':
+        case 'pipeline':
+          if (mapping.path) {
+            params[mapping.variable] = `{{${mapping.source}.${mapping.path}}}`;
+          }
+          break;
+        default:
+          break;
+      }
+
+      if (mapping.fallback) {
+        fallbacks[mapping.variable] = mapping.fallback;
+      }
+    }
+
+    return { params, fallbacks };
   }
 
   private renderTemplate(
@@ -265,18 +322,26 @@ export class SendMessageNode extends BaseNode {
           };
         }
 
-        const params = interpolatedNodeData.templateParams ?? {};
+        const { params, fallbacks } =
+          this.buildVariableParams(interpolatedNodeData);
         messageContent = this.renderTemplate(template, params);
         templateId = template.id;
         // The CRM re-renders server-side for channel-bound templates
         // (WhatsApp Cloud sends the real Meta template); for global templates
-        // the lookup misses and our rendered content stands.
+        // the lookup misses and our rendered content stands. Known degraded
+        // path (EVO-1267): when the lookup misses, mapped {{root.path}}
+        // values stay raw in the content — the CRM's native Liquid pass
+        // covers contact/conversation roots but renders pipeline paths empty
+        // and variable_fallbacks do not apply.
         templateParams = {
           name:
             template.name ?? String(interpolatedNodeData.templateName ?? ''),
           language: template.language ?? interpolatedNodeData.templateLanguage,
           category: template.category,
           processed_params: params,
+          ...(Object.keys(fallbacks).length > 0
+            ? { variable_fallbacks: fallbacks }
+            : {}),
         };
       }
 
