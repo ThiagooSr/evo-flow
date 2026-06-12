@@ -1,10 +1,12 @@
 import {
+  Inject,
   Injectable,
   NotFoundException,
   BadRequestException,
   ConflictException,
 } from '@nestjs/common';
 import { Repository, In } from 'typeorm';
+import { randomUUID } from 'crypto';
 import {
   Campaign,
   CampaignStatus,
@@ -12,13 +14,61 @@ import {
 } from '../entities/campaign.entity';
 import { CreateCampaignDto, UpdateCampaignDto, CampaignQueryDto } from '../dto';
 import { TenantDbContext } from '../../../evo-extension-points';
+import {
+  IMESSAGE_BROKER,
+  IMessageBroker,
+} from '../../../shared/broker/interfaces/message-broker.interface';
+import {
+  CAMPAIGNS_CONTROL_TOPIC,
+  type CampaignControlAction,
+} from '../../../shared/broker/contracts/campaigns-control.contract';
 
 @Injectable()
 export class CampaignsService {
-  constructor(private readonly db: TenantDbContext) {}
+  constructor(
+    private readonly db: TenantDbContext,
+    @Inject(IMESSAGE_BROKER) private readonly broker: IMessageBroker,
+  ) {}
 
   private get campaignRepository(): Repository<Campaign> {
     return this.db.getRepository(Campaign);
+  }
+
+  /**
+   * EVO-1222 [4.8]: publish the fast-path `campaigns.control` event after an
+   * authoritative status transition so packer/sender drop their cached status
+   * and honor the change in <1s (the Postgres flag remains the source of
+   * truth).
+   *
+   * correlationId is a freshly minted UUID v4 — the contract is `z.uuidv4()`
+   * and pipeline correlation ids are producer-minted (matches the
+   * `campaigns.pack` producer). Propagating the request CLS id would feed a
+   * possibly non-v4 token (`SAFE_CORRELATION_ID` is looser than v4) that both
+   * consumers would reject as a malformed payload.
+   */
+  private async publishControl(
+    campaignId: string,
+    action: CampaignControlAction,
+  ): Promise<void> {
+    try {
+      await this.broker.publish(CAMPAIGNS_CONTROL_TOPIC, {
+        campaignId,
+        action,
+        correlationId: randomUUID(),
+      });
+    } catch (err) {
+      // Fast-path only: the authoritative Postgres status was already persisted,
+      // so a broker outage must NOT fail the transition (nor trip the
+      // controller's workflow compensation). The sender honors the flag at its
+      // next recheck (≤5s TTL, within NFR5). Reported via console to match this
+      // service's existing error-reporting style.
+      console.warn(
+        `[campaigns.control] publish failed for campaign ${campaignId} ` +
+          `(${action}); relying on the authoritative status flag: ${
+            (err as Error).message
+          }`,
+      );
+    }
   }
 
   async create(createCampaignDto: CreateCampaignDto): Promise<Campaign> {
@@ -188,7 +238,9 @@ export class CampaignsService {
     }
 
     campaign.status = CampaignStatus.PAUSED;
-    return this.campaignRepository.save(campaign);
+    const saved = await this.campaignRepository.save(campaign);
+    await this.publishControl(id, 'pause');
+    return saved;
   }
 
   async resume(id: string): Promise<Campaign> {
@@ -201,7 +253,9 @@ export class CampaignsService {
     }
 
     campaign.status = CampaignStatus.SENDING;
-    return this.campaignRepository.save(campaign);
+    const saved = await this.campaignRepository.save(campaign);
+    await this.publishControl(id, 'resume');
+    return saved;
   }
 
   async stop(id: string): Promise<Campaign> {
@@ -219,7 +273,9 @@ export class CampaignsService {
     }
 
     campaign.status = CampaignStatus.STOPPED;
-    return this.campaignRepository.save(campaign);
+    const saved = await this.campaignRepository.save(campaign);
+    await this.publishControl(id, 'stop');
+    return saved;
   }
 
   async duplicate(id: string): Promise<Campaign> {
@@ -267,12 +323,14 @@ export class CampaignsService {
           if (campaign.status === CampaignStatus.SENDING) {
             campaign.status = CampaignStatus.PAUSED;
             await this.campaignRepository.save(campaign);
+            await this.publishControl(campaign.id, 'pause');
             affectedCount++;
           }
         } else if (action === 'resume') {
           if (campaign.status === CampaignStatus.PAUSED) {
             campaign.status = CampaignStatus.SENDING;
             await this.campaignRepository.save(campaign);
+            await this.publishControl(campaign.id, 'resume');
             affectedCount++;
           }
         } else if (action === 'delete') {
