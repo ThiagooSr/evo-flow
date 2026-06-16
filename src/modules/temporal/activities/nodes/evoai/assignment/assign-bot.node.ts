@@ -24,6 +24,7 @@ export class AssignBotNode extends BaseNode {
 
   async execute(input: AssignBotNodeInput): Promise<NodeExecutionResult> {
     return await this.executeWithTiming(input.nodeId, input, async () => {
+
       // Interpolate variables in node data
       const interpolatedNodeData = await this.interpolateNodeData(
         input,
