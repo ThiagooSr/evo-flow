@@ -45,6 +45,8 @@ describe('SendEmailTeamNode', () => {
     });
 
     expect(sendEmailTeam).not.toHaveBeenCalled();
-    expect(result.success).toBe(true);
+    expect(result.success).toBe(false);
+    expect(result.skipped).toBe(true);
+    expect(result.error).toContain('missing_team_ids_or_message');
   });
 });

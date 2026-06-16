@@ -281,6 +281,7 @@ export class SendMessageNode extends BaseNode {
             error: 'No conversationId available from trigger event',
           },
           skipped: true,
+          reason: 'no_conversation_id',
         };
       }
 
@@ -372,6 +373,9 @@ export class SendMessageNode extends BaseNode {
       };
     })
       .then(({ result, executionTime }) => {
+        if (result?.skipped) {
+          return this.createSkippedResult(result.reason, executionTime);
+        }
         const successResult = this.createSuccessResult(input, executionTime, {
           [`node_${input.nodeId}_message_sent`]: result.messageSent,
           [`node_${input.nodeId}_message_id`]: result.messageId,
