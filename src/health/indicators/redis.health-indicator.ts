@@ -35,6 +35,7 @@ export class RedisHealthIndicator
       port: redis.port,
       password: redis.password,
       db: redis.db,
+      ...(redis.tls ? { tls: redis.tls } : {}),
       lazyConnect: true,
       maxRetriesPerRequest: 1,
       enableReadyCheck: true,

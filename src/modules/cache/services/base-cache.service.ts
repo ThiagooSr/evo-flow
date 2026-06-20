@@ -384,6 +384,7 @@ export abstract class BaseCacheService<
       port: this.config.redis?.port || 6379,
       password: this.config.redis?.password,
       db: this.config.redis?.db || 5,
+      ...(this.config.redis?.tls ? { tls: this.config.redis.tls } : {}),
       maxRetriesPerRequest: 3,
       enableReadyCheck: true,
       lazyConnect: true,

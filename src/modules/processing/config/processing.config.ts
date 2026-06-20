@@ -17,6 +17,10 @@ export interface ProcessingConfig {
     password?: string;
     db?: number;
     queueName: string;
+    // TLS: derivado de REDIS_SSL=true (managed Redis/Valkey TLS-only, ex. DigitalOcean
+    // porta 25061). Quando setado, os clientes ioredis devem espalhar `tls: this`.
+    // Objeto vazio = TLS com defaults (suficiente p/ DO Valkey). undefined = sem TLS.
+    tls?: Record<string, never>;
   };
 
   // Configurações RabbitMQ
@@ -115,6 +119,9 @@ export function getProcessingConfig(): ProcessingConfig {
       password: process.env.REDIS_PASSWORD,
       db: parseInt(process.env.REDIS_DB || '5'),
       queueName: process.env.REDIS_QUEUE_NAME || 'evo-campaign-events',
+      // TLS-only managed Redis (REDIS_SSL=true) exige tls; sem isto o handshake é
+      // derrubado (ECONNRESET) — era o que travava o readiness/RedisHealthIndicator.
+      tls: process.env.REDIS_SSL === 'true' ? {} : undefined,
     },
 
     // RabbitMQ config
