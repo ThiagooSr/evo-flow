@@ -13,6 +13,7 @@ import {
 } from '../interfaces/cache.interfaces';
 import { CustomLoggerService } from 'src/common/services/custom-logger.service';
 import { RedisSingleton } from './redis-singleton.service';
+import { EvoExtensionPoints } from '../../../evo-extension-points/registry';
 
 /**
  * Base Cache Service (single-account)
@@ -199,7 +200,7 @@ export abstract class BaseCacheService<
    * Get all entities (single-account: every entity in the workspace)
    */
   async getAll(limit?: number): Promise<C[]> {
-    const indexKey = `${this.cacheConfig.redisKeyPrefix}:index`;
+    const indexKey = `${this.scopedPrefix}:index`;
 
     try {
       await this.ensureRedisConnected();
@@ -321,7 +322,7 @@ export abstract class BaseCacheService<
    */
   async invalidateAll(): Promise<void> {
     await this.ensureRedisConnected();
-    const indexKey = `${this.cacheConfig.redisKeyPrefix}:index`;
+    const indexKey = `${this.scopedPrefix}:index`;
 
     const entityIds = await this.redis.smembers(indexKey);
 
@@ -470,8 +471,27 @@ export abstract class BaseCacheService<
     );
   }
 
+  /**
+   * Redis key prefix for the active request scope. The `cache_key_scope`
+   * extension point returns an opaque per-request suffix (empty in standalone —
+   * one shared namespace; non-empty under an enterprise overlay — a namespace per
+   * scope, so a cache index built by one scope isn't served to another). The
+   * cache layer stays scope-agnostic: it just appends whatever suffix it gets.
+   */
+  protected get scopedPrefix(): string {
+    let suffix = '';
+    try {
+      suffix = EvoExtensionPoints.get('cache_key_scope')() || '';
+    } catch {
+      suffix = '';
+    }
+    return suffix
+      ? `${this.cacheConfig.redisKeyPrefix}:${suffix}`
+      : this.cacheConfig.redisKeyPrefix;
+  }
+
   private getCacheKey(id: string): string {
-    return `${this.cacheConfig.redisKeyPrefix}:${id}`;
+    return `${this.scopedPrefix}:${id}`;
   }
 
   private async getFromRedis(key: string): Promise<C | null> {
@@ -563,7 +583,7 @@ export abstract class BaseCacheService<
   private async addToIndex(entityId: string): Promise<void> {
     try {
       await this.ensureRedisConnected();
-      const indexKey = `${this.cacheConfig.redisKeyPrefix}:index`;
+      const indexKey = `${this.scopedPrefix}:index`;
 
       try {
         await this.redis.sadd(indexKey, entityId);
@@ -589,7 +609,7 @@ export abstract class BaseCacheService<
 
     try {
       await this.ensureRedisConnected();
-      const indexKey = `${this.cacheConfig.redisKeyPrefix}:index`;
+      const indexKey = `${this.scopedPrefix}:index`;
 
       try {
         await this.redis.sadd(indexKey, ...entityIds);
@@ -613,7 +633,7 @@ export abstract class BaseCacheService<
   private async removeFromIndex(entityId: string): Promise<void> {
     try {
       await this.ensureRedisConnected();
-      const indexKey = `${this.cacheConfig.redisKeyPrefix}:index`;
+      const indexKey = `${this.scopedPrefix}:index`;
       await this.redis.srem(indexKey, entityId);
     } catch (error) {
       this.logger.warn(

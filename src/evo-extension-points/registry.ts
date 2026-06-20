@@ -63,12 +63,26 @@ export type TenantDbContextImpl = <T>(
   work: (manager: EntityManager) => Promise<T>,
 ) => Promise<T>;
 
+/**
+ * Cache-key scope seam. Returns an opaque per-request scope suffix that the cache
+ * layer folds into its Redis keys/index, so caches don't share one global
+ * namespace across the active scope. The runtime never knows what the scope IS —
+ * the community default returns `''` (single-scope / OSS parity: one shared
+ * namespace, today's behaviour). An enterprise overlay returns a non-empty,
+ * request-bound suffix so each scope gets its own cache namespace + index.
+ *
+ * Returning a string keeps the cache code trivial: `key = base + suffix`. Empty
+ * suffix = unchanged keys (no migration, no behaviour change in standalone).
+ */
+export type CacheKeyScopeImpl = () => string;
+
 export interface ExtensionPointImplementations {
   capability_gate: CapabilityGateImpl;
   runtime_context: RuntimeContextImpl;
   plugin_loader: PluginLoaderImpl;
   theme_tokens: ThemeTokensImpl;
   tenant_db_context: TenantDbContextImpl;
+  cache_key_scope: CacheKeyScopeImpl;
 }
 
 const defaultCapabilityGate: CapabilityGateImpl = () => true;
@@ -88,6 +102,10 @@ const defaultTenantDbContext: TenantDbContextImpl = (
   work,
 ) => work(dataSource.manager);
 
+// No scope suffix: caches keep their single global namespace (OSS / standalone
+// parity). An enterprise overlay returns a request-bound suffix.
+const defaultCacheKeyScope: CacheKeyScopeImpl = () => '';
+
 class ExtensionPointRegistry {
   private readonly implementations: ExtensionPointImplementations = {
     capability_gate: defaultCapabilityGate,
@@ -95,6 +113,7 @@ class ExtensionPointRegistry {
     plugin_loader: defaultPluginLoader,
     theme_tokens: defaultThemeTokens,
     tenant_db_context: defaultTenantDbContext,
+    cache_key_scope: defaultCacheKeyScope,
   };
 
   replace<K extends ExtensionPointName>(
@@ -122,6 +141,7 @@ class ExtensionPointRegistry {
     this.implementations.plugin_loader = defaultPluginLoader;
     this.implementations.theme_tokens = defaultThemeTokens;
     this.implementations.tenant_db_context = defaultTenantDbContext;
+    this.implementations.cache_key_scope = defaultCacheKeyScope;
   }
 }
 
