@@ -5,7 +5,11 @@ import {
 
 describe('UpdateCustomAttributeNode', () => {
   let node: UpdateCustomAttributeNode;
-  let contactsService: { findById: jest.Mock; updateCustomAttribute: jest.Mock };
+  let contactsService: {
+    findById: jest.Mock;
+    updateCustomAttribute: jest.Mock;
+    setCustomAttributes: jest.Mock;
+  };
   let customAttributesService: Record<string, jest.Mock>;
   let warnSpy: jest.SpyInstance;
 
@@ -25,6 +29,7 @@ describe('UpdateCustomAttributeNode', () => {
     contactsService = {
       findById: jest.fn(),
       updateCustomAttribute: jest.fn(),
+      setCustomAttributes: jest.fn(),
     };
     customAttributesService = {};
 
@@ -50,18 +55,28 @@ describe('UpdateCustomAttributeNode', () => {
     jest.restoreAllMocks();
   });
 
-  it('happy path: calls findById then updateCustomAttribute with attributeName as key', async () => {
-    contactsService.findById.mockResolvedValue({ id: 'c3' });
-    contactsService.updateCustomAttribute.mockResolvedValue(undefined);
+  it('happy path: read-modify-write — merges new attribute into existing custom_attributes by slug (EVO-1850)', async () => {
+    // Pre-existing custom attributes must survive: the CRM PATCH replaces the
+    // whole column, so the node sends the full merged map.
+    // findById returns the raw CRM wire format (snake_case `custom_attributes`);
+    // the node maps it via mapContactDto before merging. Mocking the camelCase
+    // shape the client never produces would mask the read-side field bug.
+    contactsService.findById.mockResolvedValue({
+      id: 'c3',
+      custom_attributes: { existing_attr: 'keep', another: 42 },
+    });
+    contactsService.setCustomAttributes.mockResolvedValue(undefined);
 
     const result = await node.execute(baseInput);
 
     expect(contactsService.findById).toHaveBeenCalledWith('c3');
-    expect(contactsService.updateCustomAttribute).toHaveBeenCalledWith(
-      'c3',
-      'plan_tier',
-      'gold',
-    );
+    expect(contactsService.setCustomAttributes).toHaveBeenCalledWith('c3', {
+      existing_attr: 'keep',
+      another: 42,
+      plan_tier: 'gold',
+    });
+    // The deprecated single-key replace path must NOT be used.
+    expect(contactsService.updateCustomAttribute).not.toHaveBeenCalled();
     expect(result.success).toBe(true);
     expect(result.variables).toMatchObject({
       [`node_n3_attribute_updated`]: 'attr-id-1',
@@ -72,12 +87,31 @@ describe('UpdateCustomAttributeNode', () => {
     });
   });
 
+  it('overwrite: reports the previous value when the slug already had one', async () => {
+    contactsService.findById.mockResolvedValue({
+      id: 'c3',
+      custom_attributes: { plan_tier: 'silver', keep_me: 'x' },
+    });
+    contactsService.setCustomAttributes.mockResolvedValue(undefined);
+
+    const result = await node.execute(baseInput);
+
+    expect(contactsService.setCustomAttributes).toHaveBeenCalledWith('c3', {
+      plan_tier: 'gold',
+      keep_me: 'x',
+    });
+    expect(result.variables).toMatchObject({
+      [`node_n3_previous_value`]: 'silver',
+      [`node_n3_new_value`]: 'gold',
+    });
+  });
+
   it('contact 404: skips with contact_not_found instead of reporting success (EVO-1757)', async () => {
     contactsService.findById.mockResolvedValue(null);
 
     const result = await node.execute(baseInput);
 
-    expect(contactsService.updateCustomAttribute).not.toHaveBeenCalled();
+    expect(contactsService.setCustomAttributes).not.toHaveBeenCalled();
     expect(warnSpy).toHaveBeenCalledWith(
       expect.stringContaining('contact not found'),
       expect.objectContaining({ contactId: 'c3', attributeId: 'attr-id-1' }),
@@ -88,8 +122,8 @@ describe('UpdateCustomAttributeNode', () => {
   });
 
   it('service throw: propagates as createErrorResult', async () => {
-    contactsService.findById.mockResolvedValue({ id: 'c3' });
-    contactsService.updateCustomAttribute.mockRejectedValue(
+    contactsService.findById.mockResolvedValue({ id: 'c3', custom_attributes: {} });
+    contactsService.setCustomAttributes.mockRejectedValue(
       new Error('CRM 500'),
     );
 

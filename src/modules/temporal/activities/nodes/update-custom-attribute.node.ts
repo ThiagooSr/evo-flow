@@ -1,5 +1,6 @@
 import { BaseNode, NodeExecutionResult } from './base.node';
 import { getAppContext } from '../../../../shared/app-context.holder';
+import { mapContactDto } from '../../../../shared/crm-client/types/contact';
 
 export interface UpdateCustomAttributeNodeInput {
   nodeId: string;
@@ -49,9 +50,9 @@ export class UpdateCustomAttributeNode extends BaseNode {
       const { contactsService } = await this.getServices();
 
       try {
-        const contact: any = await contactsService.findById(input.contactId);
+        const dto = await contactsService.findById(input.contactId);
 
-        if (!contact) {
+        if (!dto) {
           this.logger.warn(
             'UpdateCustomAttributeNode: contact not found',
             { contactId: input.contactId, attributeId: input.nodeData.attributeId },
@@ -59,14 +60,37 @@ export class UpdateCustomAttributeNode extends BaseNode {
           return { skipped: true, reason: 'contact_not_found' } as any;
         }
 
-        // Q3-contacts-service contract: updateCustomAttribute(contactId, attrKey, value).
-        // attrKey == input.nodeData.attributeName (CRM Rails merges by key in the
-        // custom_attributes JSON column). No client-side read-modify-write — the
-        // CRM PATCH merges server-side, so previousValue is not derivable here.
-        await contactsService.updateCustomAttribute(
+        // findById returns the raw CRM ContactDto in snake_case wire format
+        // (`custom_attributes`), so map it to the HydratedContact shape before
+        // reading. Reading `dto.customAttributes` directly is always undefined
+        // → existingAttributes would be {} → the read-modify-write below would
+        // send a single-key map and the CRM PATCH (which REPLACES the column)
+        // would wipe every other custom attribute on each run. Mirrors the
+        // read side in conditional.node.ts (EVO-1837).
+        const contact = mapContactDto(dto);
+
+        // attributeName carries the attribute_key (slug) — the canonical
+        // custom_attributes JSONB key (EVO-1850). The CRM Rails
+        // `PATCH /contacts/:id` REPLACES the whole custom_attributes column
+        // (it does NOT merge), so we read-modify-write: spread the contact's
+        // existing customAttributes and override just this key, otherwise every
+        // other custom attribute would be wiped on each run.
+        const attributeApiKey = input.nodeData.attributeName;
+        const existingAttributes = (contact?.customAttributes ?? {}) as Record<
+          string,
+          unknown
+        >;
+        const previousValue =
+          attributeApiKey in existingAttributes
+            ? existingAttributes[attributeApiKey]
+            : null;
+        const mergedAttributes = {
+          ...existingAttributes,
+          [attributeApiKey]: input.nodeData.newValue,
+        };
+        await contactsService.setCustomAttributes(
           input.contactId,
-          input.nodeData.attributeName,
-          input.nodeData.newValue,
+          mergedAttributes,
         );
 
         this.logger.log('Custom attribute updated successfully', {
@@ -81,8 +105,8 @@ export class UpdateCustomAttributeNode extends BaseNode {
           attributeUpdated: true,
           attributeId: input.nodeData.attributeId,
           attributeName: input.nodeData.attributeName,
-          attributeApiKey: input.nodeData.attributeName,
-          previousValue: null,
+          attributeApiKey,
+          previousValue,
           newValue: input.nodeData.newValue,
         };
       } catch (error) {
