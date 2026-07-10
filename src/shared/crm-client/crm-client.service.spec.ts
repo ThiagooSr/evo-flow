@@ -26,6 +26,11 @@ process.env.EVOAI_CRM_BASE_URL = 'http://crm-test.local';
 process.env.EVOAI_CRM_API_TOKEN = 'svc-token';
 process.env.EVOAI_CRM_RETRY_MAX_ATTEMPTS = '2';
 process.env.EVOAI_CRM_CIRCUIT_THRESHOLD = '3';
+// Generic-path hardening (EVO-1205): single zero-delay retry keeps these
+// status-mapping cases fast. The (1s, 2s, 4s) schedule + the dedicated
+// ContactsClientUnavailableException contract are covered in
+// crm-client.hardening.spec.ts.
+process.env.EVOAI_CRM_CLIENT_RETRY_BACKOFF_MS = '0';
 
 import { CrmClientService } from './crm-client.service';
 
@@ -214,6 +219,71 @@ describe('CrmClientService', () => {
       expect(fetchMock).toHaveBeenCalledTimes(2);
 
       jest.useRealTimers();
+    });
+  });
+
+  // EVO-1272: pins the HTTP contract the Journey "Move to Pipeline Stage" node
+  // depends on. Mocking the client method elsewhere can't catch a URL/param/
+  // envelope drift between evo-flow and the Rails endpoint — this can.
+  describe('moveToPipelineStage — Journey move node contract', () => {
+    it('PATCHes /pipeline_items/move_conversation with conversation_id + pipeline_stage_id', async () => {
+      fetchMock.mockResolvedValueOnce(
+        buildFetchResponse({
+          status: 200,
+          body: {
+            success: true,
+            data: { moved: true, movement_type: 'cross_pipeline' },
+          },
+        }),
+      );
+
+      const result = await service.moveToPipelineStage('p1', 'conv-1', 'st9');
+
+      const [url, init] = fetchMock.mock.calls[0];
+      expect(url).toBe(
+        'http://crm-test.local/api/v1/pipelines/p1/pipeline_items/move_conversation',
+      );
+      expect(init.method).toBe('PATCH');
+      expect(JSON.parse(init.body)).toEqual({
+        conversation_id: 'conv-1',
+        pipeline_stage_id: 'st9',
+      });
+      // The move result is nested one level under the success_response envelope.
+      expect(result.success).toBe(true);
+      expect(result.data.data.movement_type).toBe('cross_pipeline');
+    });
+  });
+
+  // EVO-1273: pins the HTTP contract the Journey "Create Pipeline Task" node
+  // depends on (URL, method, body and the nested envelope).
+  describe('createPipelineTask — Journey create-task node contract', () => {
+    it('POSTs /pipeline_tasks/for_conversation with conversation_id + task fields', async () => {
+      fetchMock.mockResolvedValueOnce(
+        buildFetchResponse({
+          status: 201,
+          body: { success: true, data: { created: true, task_id: 'task-1' } },
+        }),
+      );
+
+      const result = await service.createPipelineTask('conv-1', {
+        title: 'Call lead',
+        priority: 'high',
+        due_in: '2.hours',
+      });
+
+      const [url, init] = fetchMock.mock.calls[0];
+      expect(url).toBe(
+        'http://crm-test.local/api/v1/pipeline_tasks/for_conversation',
+      );
+      expect(init.method).toBe('POST');
+      expect(JSON.parse(init.body)).toEqual({
+        conversation_id: 'conv-1',
+        title: 'Call lead',
+        priority: 'high',
+        due_in: '2.hours',
+      });
+      expect(result.success).toBe(true);
+      expect(result.data.data.task_id).toBe('task-1');
     });
   });
 

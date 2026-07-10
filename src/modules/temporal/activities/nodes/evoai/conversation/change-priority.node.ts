@@ -5,6 +5,7 @@ export interface ChangePriorityNodeInput {
   nodeId: string;
   conversationId: string;
   sessionId: string;
+  journeyId?: string; // EVO-1917: resolve journey-default {{variables}} via interpolateNodeData
   nodeData: {
     priority?: 'low' | 'medium' | 'high' | 'urgent' | null;
     nextNodeId?: string;
@@ -15,12 +16,15 @@ export class ChangePriorityNode extends BaseNode {
   private crmService: CrmClientService;
 
   constructor() {
-    super('change-priority');
+    super('change-priority', 'conversation');
     this.crmService = new CrmClientService();
   }
 
   async execute(input: ChangePriorityNodeInput): Promise<NodeExecutionResult> {
+    const skip = this.contextSkip(input);
+    if (skip) return skip;
     return await this.executeWithTiming(input.nodeId, input, async () => {
+
       // Interpolate variables in node data
       const interpolatedNodeData = await this.interpolateNodeData(
         input,

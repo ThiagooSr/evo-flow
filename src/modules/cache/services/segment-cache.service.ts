@@ -94,7 +94,7 @@ export class SegmentCacheService extends BaseCacheService<
   async clearAllCaches(): Promise<void> {
     try {
       const keys = await this.redis.keys(
-        `${this.cacheConfig.redisKeyPrefix}:*`,
+        `${this.scopedPrefix}:*`,
       );
       if (keys.length > 0) {
         await this.redis.del(...keys);
@@ -157,7 +157,7 @@ export class SegmentCacheService extends BaseCacheService<
   }
 
   private buildCacheKey(id: string): string {
-    return `${this.cacheConfig.redisKeyPrefix}:${id}`;
+    return `${this.scopedPrefix}:${id}`;
   }
 
   private async storeInRedis(key: string, value: CachedSegment): Promise<void> {

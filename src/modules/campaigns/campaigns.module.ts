@@ -14,14 +14,10 @@ import { CampaignTemplatesController } from './controllers/campaign-templates.co
 import { CampaignsService } from './services/campaigns.service';
 import { CampaignTemplatesService } from './services/campaign-templates.service';
 import { TemplateReplicationService } from './services/template-replication.service';
-import { SegmentQueryBuilderService } from './services/segment-query-builder.service';
-import { AudienceComputationService } from './services/audience-computation.service';
 import { AudienceValidationService } from './services/audience-validation.service';
 import { CampaignWorkflowService } from './services/campaign-workflow.service';
-import { CampaignMessageSenderService } from './services/campaign-message-sender.service';
 import { CampaignExecutionsService } from './services/campaign-executions.service';
 import { ContactsModule } from '../contacts/contacts.module';
-import { SegmentsModule } from '../segments/segments.module';
 
 @Module({
   imports: [
@@ -37,32 +33,22 @@ import { SegmentsModule } from '../segments/segments.module';
     ]),
     ConfigModule,
     ContactsModule,
-    SegmentsModule,
   ],
-  controllers: [
-    CampaignsController,
-    CampaignTemplatesController,
-  ],
+  controllers: [CampaignsController, CampaignTemplatesController],
   providers: [
     CampaignsService,
     CampaignTemplatesService,
     TemplateReplicationService,
-    SegmentQueryBuilderService,
-    AudienceComputationService,
     AudienceValidationService,
     CampaignWorkflowService,
-    CampaignMessageSenderService,
     CampaignExecutionsService,
   ],
   exports: [
     CampaignsService,
     CampaignTemplatesService,
     TemplateReplicationService,
-    SegmentQueryBuilderService,
-    AudienceComputationService,
     AudienceValidationService,
     CampaignWorkflowService,
-    CampaignMessageSenderService,
     CampaignExecutionsService,
   ],
 })

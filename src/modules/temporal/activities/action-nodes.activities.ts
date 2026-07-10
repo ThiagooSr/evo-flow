@@ -26,6 +26,11 @@ import {
   TriggerNodeInput,
 } from './nodes';
 import { SendMessageNode, SendMessageNodeInput } from './nodes/evoai/communication/send-message.node';
+import { SendCannedResponseNode, SendCannedResponseNodeInput } from './nodes/evoai/communication/send-canned-response.node';
+import { SendEmailTeamNode, SendEmailTeamNodeInput } from './nodes/evoai/communication/send-email-team.node';
+import { AssignToPipelineNode, AssignToPipelineNodeInput } from './nodes/evoai/pipeline/assign-to-pipeline.node';
+import { MoveToPipelineStageNode, MoveToPipelineStageNodeInput } from './nodes/evoai/pipeline/move-to-pipeline-stage.node';
+import { CreatePipelineTaskNode, CreatePipelineTaskNodeInput } from './nodes/evoai/pipeline/create-pipeline-task.node';
 import { SendTranscriptNode, SendTranscriptNodeInput } from './nodes/evoai/communication/send-transcript.node';
 import { AssignAgentNode, AssignAgentNodeInput } from './nodes/evoai/assignment/assign-agent.node';
 import { AssignTeamNode, AssignTeamNodeInput } from './nodes/evoai/assignment/assign-team.node';
@@ -35,7 +40,10 @@ import { ResolveConversationNode, ResolveConversationNodeInput } from './nodes/e
 import { SnoozeConversationNode, SnoozeConversationNodeInput } from './nodes/evoai/conversation/snooze-conversation.node';
 import { ChangePriorityNode, ChangePriorityNodeInput } from './nodes/evoai/conversation/change-priority.node';
 import { ScheduledActionNode, ScheduledActionNodeInput } from './nodes/scheduled-action.node';
-import { calculateWaitTimes } from '../utils/wait-time.util';
+import {
+  calculateWaitTimes,
+  resolveWaitTimeoutMs,
+} from '../utils/wait-time.util';
 
 // Re-export interfaces for backward compatibility
 export {
@@ -60,6 +68,11 @@ export {
   MuteConversationNodeInput,
   ResolveConversationNodeInput,
   SnoozeConversationNodeInput,
+  SendCannedResponseNodeInput,
+  SendEmailTeamNodeInput,
+  AssignToPipelineNodeInput,
+  MoveToPipelineStageNodeInput,
+  CreatePipelineTaskNodeInput,
   ChangePriorityNodeInput,
   ScheduledActionNodeInput,
 };
@@ -97,6 +110,21 @@ export interface ActionNodeActivities {
   executeSendMessageNode(
     input: SendMessageNodeInput,
   ): Promise<NodeExecutionResult>;
+  executeSendCannedResponseNode(
+    input: SendCannedResponseNodeInput,
+  ): Promise<NodeExecutionResult>;
+  executeSendEmailTeamNode(
+    input: SendEmailTeamNodeInput,
+  ): Promise<NodeExecutionResult>;
+  executeAssignToPipelineNode(
+    input: AssignToPipelineNodeInput,
+  ): Promise<NodeExecutionResult>;
+  executeMoveToPipelineStageNode(
+    input: MoveToPipelineStageNodeInput,
+  ): Promise<NodeExecutionResult>;
+  executeCreatePipelineTaskNode(
+    input: CreatePipelineTaskNodeInput,
+  ): Promise<NodeExecutionResult>;
   executeSendTranscriptNode(
     input: SendTranscriptNodeInput,
   ): Promise<NodeExecutionResult>;
@@ -131,6 +159,13 @@ export interface ActionNodeActivities {
     nodeData: any;
     waitResult: 'success' | 'timeout' | 'cancelled';
   }): Promise<string | undefined>;
+  resolveWaitHandle(input: {
+    nodeId: string;
+    contactId: string;
+    sessionId: string;
+    nodeData: any;
+    waitResult: 'success' | 'timeout' | 'cancelled';
+  }): Promise<string | undefined>;
 }
 
 // Node instances for modular execution - using lazy initialization to avoid Temporal context issues
@@ -146,6 +181,11 @@ let sendWebhookNode: SendWebhookNode;
 let conditionalNode: ConditionalNode;
 let triggerNode: TriggerNode;
 let sendMessageNode: SendMessageNode;
+let sendCannedResponseNode: SendCannedResponseNode;
+let sendEmailTeamNode: SendEmailTeamNode;
+let assignToPipelineNode: AssignToPipelineNode;
+let moveToPipelineStageNode: MoveToPipelineStageNode;
+let createPipelineTaskNode: CreatePipelineTaskNode;
 let sendTranscriptNode: SendTranscriptNode;
 let assignAgentNode: AssignAgentNode;
 let assignTeamNode: AssignTeamNode;
@@ -215,6 +255,35 @@ function getTriggerNode() {
 function getSendMessageNode() {
   if (!sendMessageNode) sendMessageNode = new SendMessageNode();
   return sendMessageNode;
+}
+
+function getSendCannedResponseNode() {
+  if (!sendCannedResponseNode)
+    sendCannedResponseNode = new SendCannedResponseNode();
+  return sendCannedResponseNode;
+}
+
+function getSendEmailTeamNode() {
+  if (!sendEmailTeamNode) sendEmailTeamNode = new SendEmailTeamNode();
+  return sendEmailTeamNode;
+}
+
+function getAssignToPipelineNode() {
+  if (!assignToPipelineNode)
+    assignToPipelineNode = new AssignToPipelineNode();
+  return assignToPipelineNode;
+}
+
+function getMoveToPipelineStageNode() {
+  if (!moveToPipelineStageNode)
+    moveToPipelineStageNode = new MoveToPipelineStageNode();
+  return moveToPipelineStageNode;
+}
+
+function getCreatePipelineTaskNode() {
+  if (!createPipelineTaskNode)
+    createPipelineTaskNode = new CreatePipelineTaskNode();
+  return createPipelineTaskNode;
 }
 
 function getSendTranscriptNode() {
@@ -326,17 +395,17 @@ export const actionNodeActivities: ActionNodeActivities = {
     try {
       // Calculate wait times based on configuration
       const waitTimes = calculateWaitTimes(input.nodeData.waitType, input.nodeData);
-      
+      // Single source of truth for the timer the workflow schedules. For a pure
+      // 'time' wait this is the remaining ms until expectedCompleteAt; the
+      // workflow sleeps this long, then resumes (EVO-1931).
+      const fallbackTimeoutMs = resolveWaitTimeoutMs(waitTimes);
+
       log.info('🚨 DEBUG: Wait times calculated', {
         nodeId: input.nodeId,
         waitType: input.nodeData.waitType,
         expectedCompleteAt: waitTimes.expectedCompleteAt?.toISOString(),
         fallbackAt: waitTimes.fallbackAt?.toISOString(),
-        fallbackTimeoutMs: waitTimes.fallbackAt 
-          ? waitTimes.fallbackAt.getTime() - Date.now() 
-          : waitTimes.expectedCompleteAt 
-            ? waitTimes.expectedCompleteAt.getTime() - Date.now()
-            : undefined,
+        fallbackTimeoutMs,
       });
       
       // Update session status to WAITING in database
@@ -368,11 +437,7 @@ export const actionNodeActivities: ActionNodeActivities = {
           expectedCompleteAt: waitTimes.expectedCompleteAt?.toISOString(),
           fallbackAt: waitTimes.fallbackAt?.toISOString(),
           // Use fallbackAt for 'event' and 'condition' types, expectedCompleteAt for 'time' and 'time_or_condition'
-          fallbackTimeoutMs: waitTimes.fallbackAt 
-            ? waitTimes.fallbackAt.getTime() - Date.now() 
-            : waitTimes.expectedCompleteAt 
-              ? waitTimes.expectedCompleteAt.getTime() - Date.now()
-              : undefined,
+          fallbackTimeoutMs,
         },
       };
     } catch (error: any) {
@@ -406,6 +471,36 @@ export const actionNodeActivities: ActionNodeActivities = {
     input: SendMessageNodeInput,
   ): Promise<NodeExecutionResult> {
     return await getSendMessageNode().execute(input);
+  },
+
+  async executeSendCannedResponseNode(
+    input: SendCannedResponseNodeInput,
+  ): Promise<NodeExecutionResult> {
+    return await getSendCannedResponseNode().execute(input);
+  },
+
+  async executeSendEmailTeamNode(
+    input: SendEmailTeamNodeInput,
+  ): Promise<NodeExecutionResult> {
+    return await getSendEmailTeamNode().execute(input);
+  },
+
+  async executeAssignToPipelineNode(
+    input: AssignToPipelineNodeInput,
+  ): Promise<NodeExecutionResult> {
+    return await getAssignToPipelineNode().execute(input);
+  },
+
+  async executeMoveToPipelineStageNode(
+    input: MoveToPipelineStageNodeInput,
+  ): Promise<NodeExecutionResult> {
+    return await getMoveToPipelineStageNode().execute(input);
+  },
+
+  async executeCreatePipelineTaskNode(
+    input: CreatePipelineTaskNodeInput,
+  ): Promise<NodeExecutionResult> {
+    return await getCreatePipelineTaskNode().execute(input);
   },
 
   async executeSendTranscriptNode(
@@ -481,6 +576,29 @@ export const actionNodeActivities: ActionNodeActivities = {
     );
     // Convert null to undefined
     return Promise.resolve(result || undefined);
+  },
+
+  resolveWaitHandle(input: {
+    nodeId: string;
+    contactId: string;
+    sessionId: string;
+    nodeData: any;
+    waitResult: 'success' | 'timeout' | 'cancelled';
+  }): Promise<string | undefined> {
+    // Map the wait result to the FE outgoing-edge handle
+    // (wait-success / wait-otherwise) so the workflow can route the next node
+    // by edge.sourceHandle, just like conditional/split nodes.
+    const handle = WaitNode.resolveWaitHandle(
+      {
+        nodeId: input.nodeId,
+        contactId: input.contactId,
+        sessionId: input.sessionId,
+        nodeData: input.nodeData,
+      },
+      input.waitResult,
+    );
+    // Convert null to undefined (single-output waits → no handle)
+    return Promise.resolve(handle || undefined);
   },
 };
 

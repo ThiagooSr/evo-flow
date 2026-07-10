@@ -4,10 +4,35 @@ import { getProcessingConfig } from './modules/processing/config/processing.conf
 export class AppFactory {
   static shouldStartHttpServer(): boolean {
     const config = getProcessingConfig();
-    // Only API and SINGLE modes need HTTP server
+    // Only API, SINGLE and EVENT_RECEIVER modes need the full HTTP API
+    // (body parser, global prefix, Swagger, validation, response transform).
     return [
       RunMode.SINGLE, // Development: everything
       RunMode.API, // Production: API gateway only
+      RunMode.EVENT_RECEIVER, // Production: webhook receiver (story 3.1)
+    ].includes(config.runMode);
+  }
+
+  /**
+   * Modes that must open an HTTP listener — the full-API modes above PLUS the
+   * pipeline runner modes that expose `/health` + `/ready` probes (EVO-1226).
+   * Legacy workers (event/segment/temporal/campaign) stay listener-less.
+   */
+  static shouldServeHttp(): boolean {
+    const config = getProcessingConfig();
+    return [
+      RunMode.SINGLE,
+      RunMode.API,
+      RunMode.EVENT_RECEIVER,
+      RunMode.CAMPAIGN_PACKER,
+      RunMode.CAMPAIGN_SENDER,
+      RunMode.CAMPAIGN_TRACKER,
+      RunMode.EVENT_PROCESS,
+      // EVO-1764: the dedicated journey worker must expose the probe listener so
+      // its `/ready` (journey-execution queue-health indicator) and `/metrics`
+      // (poller gauges) are scrapeable — otherwise the no-executor signal is
+      // unreachable exactly where the executor runs.
+      RunMode.TEMPORAL_WORKER,
     ].includes(config.runMode);
   }
 
@@ -53,5 +78,30 @@ export class AppFactory {
       AppFactory.shouldStartJourneyWorker() ||
       AppFactory.shouldStartCampaignWorker()
     );
+  }
+
+  static shouldStartCampaignPacker(): boolean {
+    const config = getProcessingConfig();
+    return [RunMode.SINGLE, RunMode.CAMPAIGN_PACKER].includes(config.runMode);
+  }
+
+  static shouldStartCampaignSender(): boolean {
+    const config = getProcessingConfig();
+    return [RunMode.SINGLE, RunMode.CAMPAIGN_SENDER].includes(config.runMode);
+  }
+
+  static shouldStartCampaignTracker(): boolean {
+    const config = getProcessingConfig();
+    return [RunMode.SINGLE, RunMode.CAMPAIGN_TRACKER].includes(config.runMode);
+  }
+
+  static shouldStartEventReceiver(): boolean {
+    const config = getProcessingConfig();
+    return [RunMode.SINGLE, RunMode.EVENT_RECEIVER].includes(config.runMode);
+  }
+
+  static shouldStartEventProcess(): boolean {
+    const config = getProcessingConfig();
+    return [RunMode.SINGLE, RunMode.EVENT_PROCESS].includes(config.runMode);
   }
 }

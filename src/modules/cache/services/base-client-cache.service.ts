@@ -10,6 +10,7 @@ import {
 } from '../interfaces/cache.interfaces';
 import { CustomLoggerService } from 'src/common/services/custom-logger.service';
 import { RedisSingleton } from './redis-singleton.service';
+import { EvoExtensionPoints } from '../../../evo-extension-points/registry';
 
 /**
  * Base Cache Service for upstream-backed entities (no TypeORM Repository).
@@ -226,7 +227,7 @@ export abstract class BaseClientCacheService<
    */
   async invalidateAll(): Promise<void> {
     await this.ensureRedisConnected();
-    const pattern = `${this.cacheConfig.redisKeyPrefix}:*`;
+    const pattern = `${this.scopedPrefix}:*`;
     const stream = this.redis.scanStream({ match: pattern, count: 200 });
     const keys: string[] = [];
 
@@ -290,6 +291,7 @@ export abstract class BaseClientCacheService<
       port: this.config.redis?.port || 6379,
       password: this.config.redis?.password,
       db: this.config.redis?.db || 5,
+      ...(this.config.redis?.tls ? { tls: this.config.redis.tls } : {}),
       maxRetriesPerRequest: 3,
       enableReadyCheck: true,
       lazyConnect: true,
@@ -369,8 +371,26 @@ export abstract class BaseClientCacheService<
     );
   }
 
+  /**
+   * Redis key prefix for the active request scope (see BaseCacheService for the
+   * full rationale). The `cache_key_scope` extension point returns an opaque
+   * per-request suffix; empty in standalone (shared namespace), non-empty under
+   * an enterprise overlay (a namespace per scope). The cache stays scope-agnostic.
+   */
+  protected get scopedPrefix(): string {
+    let suffix = '';
+    try {
+      suffix = EvoExtensionPoints.get('cache_key_scope')() || '';
+    } catch {
+      suffix = '';
+    }
+    return suffix
+      ? `${this.cacheConfig.redisKeyPrefix}:${suffix}`
+      : this.cacheConfig.redisKeyPrefix;
+  }
+
   private getCacheKey(id: string): string {
-    return `${this.cacheConfig.redisKeyPrefix}:${id}`;
+    return `${this.scopedPrefix}:${id}`;
   }
 
   private async getFromRedis(key: string): Promise<C | null> {

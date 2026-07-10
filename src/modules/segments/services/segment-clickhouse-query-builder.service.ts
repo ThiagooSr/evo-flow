@@ -96,6 +96,14 @@ export class SegmentClickHouseQueryBuilderService {
         let useArgMax = false;
         let operator = '';
         let value = '';
+        // EVO-1901 (D12): custom attributes are ingested as delta events
+        // (`contact.custom_attribute.changed`) carrying { attributeName,
+        // attributeValue, changeType }, NOT as a flat or nested `traits` key. The
+        // generic `JSONExtractString(traits, '<attr>')` extraction below never
+        // matches them (→ 0 members). When this flag is set, the condition +
+        // argMaxValue are overridden further down to read the delta stream.
+        let isCustomAttribute = false;
+        let customAttributeName = '';
 
         // Determinar como extrair o valor baseado no path
         if (userPropNode.path === 'labels') {
@@ -104,23 +112,45 @@ export class SegmentClickHouseQueryBuilderService {
           extractPath = 'labels';
           useArgMax = false; // Usar lógica simples
         } else if (userPropNode.path === 'customAttributes') {
-          // Custom attributes precisa do key específico
+          // EVO-1901 (D12 / review req-1): legacy, degenerate shape. The current
+          // frontend NEVER emits this — a custom-attribute condition is
+          // serialized as a dedicated `{ type:'CustomAttribute', attributeName,
+          // operator }` node, handled by the `case SegmentNodeType.CustomAttribute`
+          // branch below (which reads the delta stream). Verified by executing
+          // segmentNodeToStateSubQuery against the FE node shape: it dispatches to
+          // `case CustomAttribute`, never here. A bare `path:'customAttributes'`
+          // carries the attribute name in `operator.value`; left as the old flat
+          // `JSONExtractString(traits,'customAttributes.<name>')` extraction it
+          // matched zero rows and computed 0 members *silently* — the exact D12
+          // symptom. Route it through the same delta-stream read as the dotted
+          // branch and WARN, so a hit from a legacy definition is visible instead
+          // of a silent empty segment (never a silent 0).
           if (userPropNode.operator?.value) {
-            extractPath = `customAttributes.${userPropNode.operator.value}`;
+            customAttributeName = userPropNode.operator.value;
+            extractPath = customAttributeName;
+            isCustomAttribute = true;
           } else {
             extractPath = 'customAttributes';
           }
           useArgMax = true; // Custom attributes podem mudar
-        } else if (userPropNode.path.startsWith('customAttributes.')) {
-          // Path completo de custom attribute - mas na verdade está salvo como campo direto
-          const customAttributeName = userPropNode.path.replace(
-            'customAttributes.',
-            '',
+          this.logger.warn(
+            `Segment node ${userPropNode.id ?? '?'} uses the legacy bare ` +
+              `'customAttributes' UserProperty path (attributeName=` +
+              `'${userPropNode.operator?.value ?? ''}'). The frontend now emits a ` +
+              `dedicated CustomAttribute node; this path is only reachable from ` +
+              `legacy segment definitions and is read via the delta stream.`,
           );
-          extractPath = customAttributeName; // Campo direto, não aninhado
+        } else if (userPropNode.path.startsWith('customAttributes.')) {
+          // EVO-1901 (D12): the custom attribute is NOT a flat `traits.<attr>` key
+          // (the previous assumption) — it arrives as a delta event. Capture the
+          // attribute name; the condition + argMaxValue are overridden below to
+          // read `contact.custom_attribute.changed` events.
+          customAttributeName = userPropNode.path.replace('customAttributes.', '');
+          extractPath = customAttributeName;
+          isCustomAttribute = true;
           useArgMax = true; // Custom attributes podem mudar
           this.logger.debug(
-            `Custom attribute mapping: original path=${userPropNode.path}, extractPath=${extractPath}`,
+            `Custom attribute mapping: path=${userPropNode.path}, attributeName=${customAttributeName}`,
           );
         } else if (userPropNode.path.startsWith('additionalAttributes.')) {
           // Additional attributes
@@ -264,6 +294,32 @@ export class SegmentClickHouseQueryBuilderService {
               .replace(/\s+/g, ' ')
               .trim();
           }
+        }
+
+        // EVO-1901 (D12): custom attributes are stored as delta events
+        // (`contact.custom_attribute.changed` with { attributeName, attributeValue,
+        // changeType }), never as a flat/nested `traits` key — so the generic
+        // extraction above matches zero rows and segments computed 0 members. Read
+        // the attribute's change stream instead and argMax the latest value (a
+        // `removed` change clears it). generateArgMaxValidation then applies the
+        // operator/value comparison over this argMaxValue.
+        if (isCustomAttribute) {
+          condition = `event_name = 'contact.custom_attribute.changed' AND JSONExtractString(traits, 'attributeName') = '${customAttributeName}'`;
+          argMaxValue = `
+            CASE
+              WHEN contact_or_anonymous_id IN (
+                SELECT DISTINCT contact_or_anonymous_id
+                FROM contact_events
+                WHERE event_name = 'contact_deleted'
+                GROUP BY contact_or_anonymous_id
+                HAVING argMax(occurred_at, occurred_at) > 0
+              ) THEN ''
+              WHEN JSONExtractString(traits, 'changeType') = 'removed' THEN ''
+              ELSE JSONExtractString(traits, 'attributeValue')
+            END
+          `
+            .replace(/\s+/g, ' ')
+            .trim();
         }
 
         // Para campos mutáveis, incluir informação do operador e valor para validação posterior
@@ -688,16 +744,16 @@ export class SegmentClickHouseQueryBuilderService {
                     HAVING argMax(occurred_at, occurred_at) > 0
                   ) THEN 'false'
                   WHEN contact_or_anonymous_id IN (
-                    SELECT DISTINCT contact_or_anonymous_id 
-                    FROM contact_events 
-                    WHERE event_name = 'custom_attribute_changed'
-                      AND JSONExtractString(properties, 'attributeName') = '${customAttrNode.attributeName}'
+                    SELECT DISTINCT contact_or_anonymous_id
+                    FROM contact_events
+                    WHERE event_name IN ('contact.custom_attribute.changed', 'custom_attribute_changed')
+                      AND JSONExtractString(traits, 'attributeName') = '${customAttrNode.attributeName}'
                     GROUP BY contact_or_anonymous_id
                     HAVING argMax(
-                      CASE 
-                        WHEN JSONExtractString(properties, 'changeType') = 'removed' THEN ''
-                        ELSE JSONExtractString(properties, 'attributeValue')
-                      END, 
+                      CASE
+                        WHEN JSONExtractString(traits, 'changeType') = 'removed' THEN ''
+                        ELSE JSONExtractString(traits, 'attributeValue')
+                      END,
                       occurred_at
                     ) ${operator === 'NotEquals' ? '=' : 'LIKE'} ${operator === 'NotEquals' ? `'${value}'` : `'%${value}%'`}
                   ) THEN 'false'
@@ -719,22 +775,24 @@ export class SegmentClickHouseQueryBuilderService {
           ];
         }
 
-        // For positive conditions (Equals, Contains, etc.), use the original logic
-        // Simplified: Use only custom_attribute_changed events
-        const condition = `event_name = 'custom_attribute_changed' AND JSONExtractString(properties, 'attributeName') = '${customAttrNode.attributeName}'`;
+        // For positive conditions (Equals, Contains, etc.), use the original logic.
+        // The custom-attribute change is an identify-DTO event: the CRM stores the
+        // canonical dotted name and the payload in the `traits` column, not
+        // `properties` (EVO-1839). Accept both event-name forms; read from traits.
+        const condition = `event_name IN ('contact.custom_attribute.changed', 'custom_attribute_changed') AND JSONExtractString(traits, 'attributeName') = '${customAttrNode.attributeName}'`;
 
         // Get the current value using argMax - handle removed attributes as empty
         const argMaxValue = `
-          CASE 
+          CASE
             WHEN contact_or_anonymous_id IN (
-              SELECT DISTINCT contact_or_anonymous_id 
-              FROM contact_events 
+              SELECT DISTINCT contact_or_anonymous_id
+              FROM contact_events
               WHERE event_name = 'contact_deleted'
               GROUP BY contact_or_anonymous_id
               HAVING argMax(occurred_at, occurred_at) > 0
             ) THEN ''
-            WHEN JSONExtractString(properties, 'changeType') = 'removed' THEN ''
-            ELSE JSONExtractString(properties, 'attributeValue')
+            WHEN JSONExtractString(traits, 'changeType') = 'removed' THEN ''
+            ELSE JSONExtractString(traits, 'attributeValue')
           END
         `
           .replace(/\s+/g, ' ')

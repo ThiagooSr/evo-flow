@@ -3,23 +3,28 @@ import {
   NotFoundException,
   BadRequestException,
 } from '@nestjs/common';
-import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { CampaignTemplate } from '../entities/campaign-template.entity';
 import { Campaign } from '../entities/campaign.entity';
 import { CreateCampaignTemplateDto } from '../dto';
 import { MessageTemplate } from '../../../shared/entities/message-template.entity';
+import { TenantDbContext } from '../../../evo-extension-points';
 
 @Injectable()
 export class CampaignTemplatesService {
-  constructor(
-    @InjectRepository(CampaignTemplate)
-    private readonly campaignTemplateRepository: Repository<CampaignTemplate>,
-    @InjectRepository(Campaign)
-    private readonly campaignRepository: Repository<Campaign>,
-    @InjectRepository(MessageTemplate)
-    private readonly messageTemplateRepository: Repository<MessageTemplate>,
-  ) {}
+  constructor(private readonly db: TenantDbContext) {}
+
+  private get campaignTemplateRepository(): Repository<CampaignTemplate> {
+    return this.db.getRepository(CampaignTemplate);
+  }
+
+  private get campaignRepository(): Repository<Campaign> {
+    return this.db.getRepository(Campaign);
+  }
+
+  private get messageTemplateRepository(): Repository<MessageTemplate> {
+    return this.db.getRepository(MessageTemplate);
+  }
 
   async create(
     campaignId: string,
@@ -86,10 +91,7 @@ export class CampaignTemplatesService {
     });
   }
 
-  async findOne(
-    id: string,
-    campaignId: string,
-  ): Promise<CampaignTemplate> {
+  async findOne(id: string, campaignId: string): Promise<CampaignTemplate> {
     const template = await this.campaignTemplateRepository.findOne({
       where: { id, campaignId },
     });
@@ -118,10 +120,7 @@ export class CampaignTemplatesService {
     return this.campaignTemplateRepository.save(template);
   }
 
-  async setWinner(
-    id: string,
-    campaignId: string,
-  ): Promise<CampaignTemplate> {
+  async setWinner(id: string, campaignId: string): Promise<CampaignTemplate> {
     const template = await this.findOne(id, campaignId);
 
     // Unset other winners

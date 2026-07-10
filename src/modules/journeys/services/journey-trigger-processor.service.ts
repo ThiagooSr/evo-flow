@@ -13,6 +13,8 @@ import { getProcessingConfig } from '../../processing/config/processing.config';
 import { CustomLoggerService } from 'src/common/services/custom-logger.service';
 import { Client, Connection } from '@temporalio/client';
 import { JourneySessionCacheService } from '../../cache/services/journey-session-cache.service';
+import { JourneyExecutionPollerService } from '../../temporal/services/journey-execution-poller.service';
+import { TEMPORAL_TASK_QUEUES } from '../../temporal/temporal-task-queues.constants';
 import { EventEmitter2 } from '@nestjs/event-emitter';
 import {
   EventTrigger,
@@ -22,6 +24,7 @@ import {
   SegmentTrigger,
   LabelTrigger,
   CustomAttributeTrigger,
+  PipelineStageChangedTrigger,
   BaseTrigger,
 } from './triggers';
 
@@ -58,6 +61,8 @@ export class JourneyTriggerProcessor implements OnModuleInit, OnModuleDestroy {
     @InjectRepository(JourneySession)
     private readonly journeySessionRepository: Repository<JourneySession>,
     injectedSessionCacheService: JourneySessionCacheService,
+    // EVO-1764: queue-health source of truth for the dispatch fail-fast guard.
+    private readonly queueHealthPoller: JourneyExecutionPollerService,
   ) {
     this.initializeTriggerHandlers();
     // Initialize singleton cache service (async but don't wait)
@@ -110,16 +115,45 @@ export class JourneyTriggerProcessor implements OnModuleInit, OnModuleDestroy {
     this.triggerHandlers.set('segment', new SegmentTrigger());
     this.triggerHandlers.set('label', new LabelTrigger());
     this.triggerHandlers.set('customattribute', new CustomAttributeTrigger());
+    this.triggerHandlers.set(
+      'pipelinestagechanged',
+      new PipelineStageChangedTrigger(),
+    );
   }
 
   async onModuleInit() {
-    if (AppFactory.shouldStartTemporalWorker() && this.config.queueMode === 'kafka') {
+    // EVO-1764: gate the journey-triggers consumer on the JOURNEY worker modes
+    // (SINGLE, TEMPORAL_WORKER) — NOT shouldStartTemporalWorker() which also
+    // includes CAMPAIGN_WORKER. The fail-fast guard's queue-health poller only
+    // runs in the journey-worker modes (shouldStartJourneyWorker), so a
+    // CAMPAIGN_WORKER consuming the shared `temporal-workers` group would get
+    // its share of journey-triggers partitions and dispatch them with the guard
+    // permanently no-op (monitoring=false → isQueueUnexecutable short-circuits
+    // to executable) — a silent split-brain stall. The campaign worker has no
+    // reason to consume journey-triggers at all.
+    if (AppFactory.shouldStartJourneyWorker()) {
       this.logger.log('🚀 Starting Journey Trigger Processor...');
+      // EVO-1927: warm the active-journey cache from Postgres BEFORE consuming.
+      // After a restart the Redis active-journey index is empty/stale and there
+      // is no implicit warm-up, so the first events would otherwise match
+      // against ZERO journeys and event-based triggers would silently die.
+      // Best-effort: a warm-up failure falls back to the read-through in
+      // JourneysService.findActive, so it must not block the consumer.
+      try {
+        const warmed = await this.journeysService.warmActiveJourneysCache();
+        this.logger.log(
+          `🔥 Warmed active-journey cache with ${warmed} journeys before consuming (EVO-1927)`,
+        );
+      } catch (error) {
+        this.logger.warn(
+          `⚠️ Failed to warm active-journey cache at boot (read-through fallback will cover this): ${error.message}`,
+        );
+      }
       await this.initializeKafkaConsumer();
       await this.startConsuming();
     } else {
       this.logger.log(
-        `⏭️  Journey Trigger Processor disabled (not in TEMPORAL-WORKER mode or queue mode is ${this.config.queueMode})`,
+        '⏭️  Journey Trigger Processor disabled (not in a journey-worker mode)',
       );
     }
   }
@@ -250,42 +284,11 @@ export class JourneyTriggerProcessor implements OnModuleInit, OnModuleDestroy {
       // 1. First, check if event satisfies any waiting sessions
       await this.checkWaitingSessions(event);
 
-      // 2. Check if contact has ANY active or waiting sessions (to avoid multiple parallel journeys)
-      this.logger.log(
-        `🔍 STEP 2: About to check for active or waiting sessions`,
-        {
-          contactId: event.contactId,
-          eventName: event.eventName,
-        },
-      );
-
-      const hasActiveOrWaitingSession =
-        await this.checkForActiveOrWaitingSessions(event.contactId);
-
-      this.logger.log(`🔍 STEP 2: Active or waiting session check result`, {
-        contactId: event.contactId,
-        eventName: event.eventName,
-        hasActiveOrWaitingSession,
-      });
-
-      if (hasActiveOrWaitingSession) {
-        this.logger.warn(
-          `🚫 BLOCKED: Contact ${event.contactId} has active or waiting session, skipping new journey triggers`,
-          {
-            eventName: event.eventName,
-            contactId: event.contactId,
-          },
-        );
-        return;
-      }
-
-      this.logger.log(
-        `✅ PROCEEDING: Contact ${event.contactId} has no active or waiting sessions, proceeding with journey triggers`,
-        {
-          eventName: event.eventName,
-          contactId: event.contactId,
-        },
-      );
+      // 2. The active/waiting-session guard is applied per-journey at trigger
+      // time (triggerJourneyExecution → checkForActiveOrWaitingSessions with the
+      // journey id), so a dangling/active session in one journey no longer blocks
+      // OTHER journeys for the same contact. A contact can run different journeys
+      // concurrently; it still can't re-enter the same journey while active. EVO-1691.
 
       // 3. Buscar journeys ativas para o account
       const activeJourneys = await this.journeysService.findActive();
@@ -375,16 +378,19 @@ export class JourneyTriggerProcessor implements OnModuleInit, OnModuleDestroy {
    */
   private async checkForActiveOrWaitingSessions(
     contactId: string,
+    journeyId?: string,
   ): Promise<boolean> {
     try {
       const contactSessions =
         await this.sessionCacheService.getSessionsByContact(contactId);
 
-      // Check if any session is in ACTIVE or WAITING status
+      // When journeyId is provided the guard is scoped to that journey only, so
+      // a session in a different journey does not block this one (EVO-1691).
       const hasActiveOrWaiting = contactSessions.some(
         (session) =>
-          session.status === JourneySessionStatus.ACTIVE ||
-          session.status === JourneySessionStatus.WAITING,
+          (journeyId === undefined || session.journeyId === journeyId) &&
+          (session.status === JourneySessionStatus.ACTIVE ||
+            session.status === JourneySessionStatus.WAITING),
       );
 
       this.logger.log('Checking for active or waiting sessions', {
@@ -393,8 +399,9 @@ export class JourneyTriggerProcessor implements OnModuleInit, OnModuleDestroy {
         activeOrWaitingSessions: contactSessions
           .filter(
             (s) =>
-              s.status === JourneySessionStatus.ACTIVE ||
-              s.status === JourneySessionStatus.WAITING,
+              (journeyId === undefined || s.journeyId === journeyId) &&
+              (s.status === JourneySessionStatus.ACTIVE ||
+                s.status === JourneySessionStatus.WAITING),
           )
           .map((s) => ({
             id: s.id,
@@ -612,6 +619,9 @@ export class JourneyTriggerProcessor implements OnModuleInit, OnModuleDestroy {
                 eventName: event.eventName,
                 eventType: event.eventType,
                 properties: JSON.parse(event.properties || '{}'),
+                // identify-DTO payload (e.g. custom attribute) rides in traits — forward it
+                // so VariableMapping can resolve it (EVO-1839).
+                traits: JSON.parse(event.traits || '{}'),
                 timestamp: event.timestamp,
               },
             }
@@ -667,10 +677,11 @@ export class JourneyTriggerProcessor implements OnModuleInit, OnModuleDestroy {
     );
 
     try {
-      // 🔍 CRITICAL: Double-check for existing sessions before creating new journey
-      // This prevents any scenario where this method is called without prior validation
+      // Block only if the contact already has an active/waiting session for THIS
+      // journey — different journeys can run concurrently (EVO-1691).
       const hasExistingSession = await this.checkForActiveOrWaitingSessions(
         event.contactId,
+        journey.id,
       );
       
       if (hasExistingSession) {
@@ -688,6 +699,46 @@ export class JourneyTriggerProcessor implements OnModuleInit, OnModuleDestroy {
         journeyId: journey.id,
         journeyName: journey.name,
       });
+
+      // EVO-1896: idempotency guard. Kafka is at-least-once, so the SAME
+      // trigger event can be redelivered after the first run already completed.
+      // The active/waiting-session guard above only blocks concurrent re-entry;
+      // it does not cover sequential replays of a terminal session. Dedup on the
+      // producer-stable messageId — scoped to (journey, contact) — so a replay
+      // of the exact same event is dropped while distinct events still start.
+      // Atomic SET NX claims the messageId for the first caller (race-safe).
+      // When messageId is absent we can't identify the event, so we skip the
+      // dedup rather than block (degrades to today's behaviour, no false drops).
+      if (event.messageId) {
+        const claimed = await this.sessionCacheService.tryClaimTriggerMessage(
+          journey.id,
+          event.contactId,
+          event.messageId,
+        );
+
+        if (!claimed) {
+          this.logger.warn(
+            '⏭️  Skipping duplicate trigger — messageId already processed for this journey/contact (EVO-1896)',
+            {
+              contactId: event.contactId,
+              journeyId: journey.id,
+              journeyName: journey.name,
+              messageId: event.messageId,
+              eventName: event.eventName,
+            },
+          );
+          return;
+        }
+      } else {
+        this.logger.warn(
+          '⚠️ Trigger event has no messageId — idempotency dedup skipped (EVO-1896)',
+          {
+            contactId: event.contactId,
+            journeyId: journey.id,
+            eventName: event.eventName,
+          },
+        );
+      }
 
       // Import JourneyExecutionWorkflow
       const { JourneyExecutionWorkflow } = await import(
@@ -714,28 +765,80 @@ export class JourneyTriggerProcessor implements OnModuleInit, OnModuleDestroy {
           eventName: event.eventName,
           eventType: event.eventType,
           properties: JSON.parse(event.properties || '{}'),
+          // identify-DTO payload (e.g. custom attribute) rides in traits — forward it
+          // so VariableMapping can resolve it (EVO-1839).
+          traits: JSON.parse(event.traits || '{}'),
           timestamp: event.timestamp,
         },
       };
 
       // Start the workflow
       const handle = await client.workflow.start(JourneyExecutionWorkflow, {
-        taskQueue: 'journey-execution',
+        taskQueue: TEMPORAL_TASK_QUEUES.JOURNEY_EXECUTION,
         workflowId,
         args: [workflowArgs],
         workflowExecutionTimeout: '30d', // Journey pode durar até 30 dias com waits
         workflowTaskTimeout: '1m',
       });
 
-      // Update session with workflow information
-      await this.sessionCacheService.updateSessionStatus(
-        sessionId,
-        'active',
-        {
+      // EVO-1764 fail-fast guard: a workflow needs a WORKFLOW poller to run even
+      // its first line, so if journey-execution has genuinely no executor the
+      // workflow we just enqueued sits unstarted until the 30d execution
+      // timeout. Detect that and surface it instead of reporting success. The
+      // check is a *fresh* live poll (closes the start→verdict race) and gates
+      // on *sustained* zero, so a transient Temporal restart/reconnect — from
+      // which the worker auto-recovers (EVO-1758) — never trips it.
+      const { unexecutable, status } =
+        await this.queueHealthPoller.isQueueUnexecutable();
+      if (unexecutable) {
+        // Terminate the just-started workflow so the session (failed) and the
+        // workflow (terminated) stay consistent — otherwise a worker appearing
+        // later would run a journey whose session is already failed.
+        await handle
+          .terminate(
+            'no journey-execution worker available at dispatch (EVO-1764)',
+          )
+          .catch((e) =>
+            this.logger.warn(
+              `Failed to terminate undispatched workflow ${workflowId}: ${e.message}`,
+            ),
+          );
+
+        await this.sessionCacheService.createFailedDispatchSession({
+          sessionId,
+          journeyId: journey.id,
+          contactId: event.contactId,
           workflowId,
           workflowRunId: handle.firstExecutionRunId,
-        },
-      );
+          errorMessage:
+            'no journey-execution worker available — journey not dispatched',
+        });
+
+        this.logger.warn(
+          '⛔ Journey not dispatched: no journey-execution worker',
+          {
+            journeyId: journey.id,
+            journeyName: journey.name,
+            contactId: event.contactId,
+            sessionId,
+            workflowId,
+            sustainedZeroMs: status.sustainedZeroMs,
+          },
+        );
+
+        // Deliberately do NOT throw: the trigger is committed, not retried.
+        // Re-queueing while the queue has no worker only builds backlog; the
+        // readiness 503 + zero-poller gauge alert ops to restore the worker, and
+        // new triggers flow once it returns. The failed session row keeps this
+        // drop auditable (EVO-1764 fail-fast decision).
+        return;
+      }
+
+      // Update session with workflow information
+      await this.sessionCacheService.updateSessionStatus(sessionId, 'active', {
+        workflowId,
+        workflowRunId: handle.firstExecutionRunId,
+      });
 
       this.logger.log(
         `✅ Journey workflow started successfully: ${workflowId}`,
@@ -768,7 +871,8 @@ export class JourneyTriggerProcessor implements OnModuleInit, OnModuleDestroy {
   async getProcessorStatus() {
     return {
       status: this.consumer ? 'connected' : 'disconnected',
-      isRunning: AppFactory.shouldStartTemporalWorker(),
+      // Mirrors the onModuleInit gate (journey-worker modes only) — EVO-1764.
+      isRunning: AppFactory.shouldStartJourneyWorker(),
       config: {
         topic: 'journey-triggers',
         groupId: 'temporal-workers',

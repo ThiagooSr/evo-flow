@@ -5,6 +5,7 @@ export interface AssignAgentNodeInput {
   nodeId: string;
   conversationId: string;
   sessionId: string;
+  journeyId?: string; // EVO-1917: resolve journey-default {{variables}} via interpolateNodeData
   nodeData: {
     agent_id?: string;
     agent_name?: string;
@@ -16,12 +17,15 @@ export class AssignAgentNode extends BaseNode {
   private crmService: CrmClientService;
 
   constructor() {
-    super('assign-agent');
+    super('assign-agent', 'conversation');
     this.crmService = new CrmClientService();
   }
 
   async execute(input: AssignAgentNodeInput): Promise<NodeExecutionResult> {
+    const skip = this.contextSkip(input);
+    if (skip) return skip;
     return await this.executeWithTiming(input.nodeId, input, async () => {
+
       // Interpolate variables in node data
       const interpolatedNodeData = await this.interpolateNodeData(
         input,

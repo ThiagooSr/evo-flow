@@ -1,5 +1,4 @@
 import { Injectable } from '@nestjs/common';
-import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { Request } from 'express';
 import { UAParser } from 'ua-parser-js';
@@ -10,6 +9,7 @@ import { GeoLocationService } from './geo-location.service';
 import { ClickContext, CachedShortLink } from '../interfaces';
 import { ShortLink } from '../entities/short-link.entity';
 import { CustomLoggerService } from 'src/common/services/custom-logger.service';
+import { TenantDbContext } from '../../../evo-extension-points';
 
 type LinkIdentifier =
   | { shortCode: string }
@@ -23,17 +23,18 @@ type LinkIdentifier =
  */
 @Injectable()
 export class ClickProcessorService {
-  private readonly logger = new CustomLoggerService(
-    ClickProcessorService.name,
-  );
+  private readonly logger = new CustomLoggerService(ClickProcessorService.name);
 
   constructor(
-    @InjectRepository(ShortLink)
-    private readonly shortLinkRepository: Repository<ShortLink>,
+    private readonly db: TenantDbContext,
     private readonly eventsService: EventsService,
     private readonly linkCacheService: LinkCacheService,
     private readonly geoLocationService: GeoLocationService,
   ) {}
+
+  private get shortLinkRepository(): Repository<ShortLink> {
+    return this.db.getRepository(ShortLink);
+  }
 
   /**
    * Process a click on a short link
@@ -49,7 +50,9 @@ export class ClickProcessorService {
       const link = await this.findLink(linkIdentifier);
 
       if (!link) {
-        this.logger.warn(`Short link not found: ${JSON.stringify(linkIdentifier)}`);
+        this.logger.warn(
+          `Short link not found: ${JSON.stringify(linkIdentifier)}`,
+        );
         return { redirectUrl: '', tracked: false };
       }
 
@@ -170,10 +173,7 @@ export class ClickProcessorService {
       }
 
       // Add query parameters from the request URL
-      const requestUrl = new URL(
-        request.url,
-        `http://${request.headers.host}`,
-      );
+      const requestUrl = new URL(request.url, `http://${request.headers.host}`);
       for (const [key, value] of requestUrl.searchParams.entries()) {
         // Allow override of existing parameters with request params
         url.searchParams.set(key, value);
@@ -206,9 +206,8 @@ export class ClickProcessorService {
     const ipAddress = this.extractIpAddress(request);
 
     // Get geolocation
-    const geoLocation = await this.geoLocationService.getLocationFromIp(
-      ipAddress,
-    );
+    const geoLocation =
+      await this.geoLocationService.getLocationFromIp(ipAddress);
 
     // Extract UTM parameters
     const requestUrl = new URL(request.url, `http://${request.headers.host}`);
@@ -244,9 +243,7 @@ export class ClickProcessorService {
       referrer: this.extractReferrer(request),
       ...utmParams,
       customParameters:
-        Object.keys(customParameters).length > 0
-          ? customParameters
-          : undefined,
+        Object.keys(customParameters).length > 0 ? customParameters : undefined,
     };
   }
 
@@ -287,9 +284,7 @@ export class ClickProcessorService {
 
     const cfConnectingIp = request.headers['cf-connecting-ip'];
     if (cfConnectingIp) {
-      return Array.isArray(cfConnectingIp)
-        ? cfConnectingIp[0]
-        : cfConnectingIp;
+      return Array.isArray(cfConnectingIp) ? cfConnectingIp[0] : cfConnectingIp;
     }
 
     // Fallback to remote address

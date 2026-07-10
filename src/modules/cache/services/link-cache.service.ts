@@ -89,7 +89,7 @@ export class LinkCacheService extends BaseCacheService<
   async incrementClickCount(shortCode: string): Promise<number> {
     try {
       await this.ensureRedisConnected();
-      const counterKey = `${this.cacheConfig.redisKeyPrefix}:clicks:${shortCode}`;
+      const counterKey = `${this.scopedPrefix}:clicks:${shortCode}`;
 
       const newCount = await this.redis.incr(counterKey);
 
@@ -109,7 +109,7 @@ export class LinkCacheService extends BaseCacheService<
   async getClickCount(shortCode: string): Promise<number> {
     try {
       await this.ensureRedisConnected();
-      const counterKey = `${this.cacheConfig.redisKeyPrefix}:clicks:${shortCode}`;
+      const counterKey = `${this.scopedPrefix}:clicks:${shortCode}`;
       const count = await this.redis.get(counterKey);
       return count ? parseInt(count, 10) : 0;
     } catch (error) {
@@ -194,7 +194,7 @@ export class LinkCacheService extends BaseCacheService<
   }
 
   private getShortCodeCacheKey(shortCode: string): string {
-    return `${this.cacheConfig.redisKeyPrefix}:code:${shortCode}`;
+    return `${this.scopedPrefix}:code:${shortCode}`;
   }
 
   private async cacheShortCode(
@@ -225,7 +225,7 @@ export class LinkCacheService extends BaseCacheService<
       this.memoryCache.delete(shortCodeKey);
     }
 
-    const counterKey = `${this.cacheConfig.redisKeyPrefix}:clicks:${shortCode}`;
+    const counterKey = `${this.scopedPrefix}:clicks:${shortCode}`;
     await this.redis.del(counterKey);
   }
 }

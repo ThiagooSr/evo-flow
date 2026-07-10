@@ -5,11 +5,25 @@ export interface SendWebhookNodeInput {
   nodeId: string;
   contactId: string;
   sessionId: string;
+  // EVO-1882: needed by interpolateNodeData to resolve journey-level variable
+  // defaults; the workflow must supply it at dispatch.
+  journeyId?: string;
   nodeData: {
     webhookUrl: string;
     method: 'GET' | 'POST' | 'PUT' | 'DELETE' | 'PATCH';
     body?: string;
     bodyType?: 'json' | 'form' | 'text' | 'xml';
+    // EVO-1858: structured key/value body builder (EVO-1742 editor model). When
+    // bodyMode is structured (or absent with rows present), the executor builds the
+    // request body from these typed rows instead of JSON.parse-ing the serialized
+    // `body` string — so number/boolean rows ship as real JSON primitives.
+    bodyStructured?: Array<{
+      id: string;
+      key: string;
+      value: string;
+      type: 'string' | 'number' | 'boolean';
+    }>;
+    bodyMode?: 'structured' | 'raw';
     headers?: Array<{ key: string; value: string }>;
     timeout?: number;
     retryAttempts?: number;
@@ -47,6 +61,8 @@ export class SendWebhookNode extends BaseNode {
         method = 'POST',
         body,
         bodyType = 'json',
+        bodyStructured,
+        bodyMode,
         headers = [],
         timeout = 30,
         retryAttempts = 0,
@@ -108,20 +124,44 @@ export class SendWebhookNode extends BaseNode {
           }
 
           // Add body for non-GET requests
-          if (body && method !== 'GET') {
-            if (bodyType === 'json') {
-              config.headers!['Content-Type'] = 'application/json';
-              config.data = JSON.parse(body);
-            } else if (bodyType === 'form') {
-              config.headers!['Content-Type'] =
-                'application/x-www-form-urlencoded';
-              config.data = body;
-            } else if (bodyType === 'xml') {
-              config.headers!['Content-Type'] = 'application/xml';
-              config.data = body;
-            } else {
-              config.headers!['Content-Type'] = 'text/plain';
-              config.data = body;
+          if (method !== 'GET') {
+            // EVO-1858: prefer the structured rows when present. Gate on
+            // `bodyMode !== 'raw'` (NOT `=== 'structured'`): the frontend only
+            // persists bodyMode on an explicit structured⇄raw toggle, so a
+            // normally-built node has rows but an undefined bodyMode. Requiring
+            // 'structured' would route every such node back to JSON.parse(body)
+            // and silently drop the typing. Mirrors getEffectiveBodyMode.
+            const useStructured =
+              bodyMode !== 'raw' &&
+              Array.isArray(bodyStructured) &&
+              bodyStructured.length > 0 &&
+              (bodyType === 'json' || bodyType === 'form');
+
+            if (useStructured) {
+              if (bodyType === 'json') {
+                config.headers!['Content-Type'] = 'application/json';
+                config.data = this.buildStructuredJson(bodyStructured!);
+              } else {
+                config.headers!['Content-Type'] =
+                  'application/x-www-form-urlencoded';
+                config.data = this.buildStructuredForm(bodyStructured!);
+              }
+            } else if (body) {
+              // Unchanged legacy / raw-mode path (back-compat).
+              if (bodyType === 'json') {
+                config.headers!['Content-Type'] = 'application/json';
+                config.data = JSON.parse(body);
+              } else if (bodyType === 'form') {
+                config.headers!['Content-Type'] =
+                  'application/x-www-form-urlencoded';
+                config.data = body;
+              } else if (bodyType === 'xml') {
+                config.headers!['Content-Type'] = 'application/xml';
+                config.data = body;
+              } else {
+                config.headers!['Content-Type'] = 'text/plain';
+                config.data = body;
+              }
             }
           }
 
@@ -211,7 +251,12 @@ export class SendWebhookNode extends BaseNode {
       return {
         webhookStatus: 'success',
         responseData: webhookResponse,
-        extractedVariables: Object.keys(extractedVariables),
+        // EVO-1916: carry the FULL key→value map (journey_<name> → value), not
+        // just Object.keys(...). The success branch below spreads this into the
+        // session variables; spreading an array of names there produced
+        // index-keyed junk ({0:'journey_x'}) and dropped every extracted value,
+        // so {{journey_<name>}} never resolved in downstream nodes (D6).
+        extractedVariables,
       };
     })
       .then(({ result, executionTime }) => {
@@ -220,6 +265,7 @@ export class SendWebhookNode extends BaseNode {
           [`node_${input.nodeId}_response_size`]: JSON.stringify(
             result.responseData || {},
           ).length,
+          // Persist the extracted journey_<name> variables onto the session.
           ...result.extractedVariables,
         });
       })
@@ -253,10 +299,84 @@ export class SendWebhookNode extends BaseNode {
   }
 
   /**
-   * Extract variable name from {{variableName}} format
+   * Resolve the bare variable name from a response-mapping `variableName`.
+   *
+   * EVO-1916: the editor stores the mapping target as a plain identifier
+   * (e.g. `echoed_qty`), but some authoring paths wrap it as `{{echoed_qty}}`.
+   * Accept both: unwrap the `{{ }}` when present, otherwise use the trimmed
+   * literal. Returning null only for a genuinely empty name means a typical
+   * mapping no longer silently drops its extracted value.
    */
-  private extractVariableName(variableExpression: string): string | null {
+  private extractVariableName(
+    variableExpression: string | null | undefined,
+  ): string | null {
+    if (!variableExpression) {
+      return null;
+    }
     const match = variableExpression.match(/\{\{([^}]+)\}\}/);
-    return match ? match[1].trim() : null;
+    const name = match ? match[1].trim() : variableExpression.trim();
+    return name.length > 0 ? name : null;
+  }
+
+  /**
+   * Build the JSON request body from structured rows (EVO-1858).
+   *
+   * Rows arrive already interpolated (interpolateNodeData recurses into the
+   * array), so coercion runs AFTER substitution. Blank-key rows are skipped to
+   * mirror the frontend `fieldsWithKey`. Returns an object — axios serializes it,
+   * matching the shape the legacy `JSON.parse(body)` path produced.
+   */
+  private buildStructuredJson(
+    fields: NonNullable<SendWebhookNodeInput['nodeData']['bodyStructured']>,
+  ): Record<string, string | number | boolean> {
+    const obj: Record<string, string | number | boolean> = {};
+    for (const f of fields) {
+      if (!f.key || f.key.trim() === '') continue;
+      obj[f.key] = this.coerceJsonValue(f.value ?? '', f.type);
+    }
+    return obj;
+  }
+
+  /**
+   * Build the form request body from structured rows (EVO-1858).
+   *
+   * Mirrors the frontend `serializeBody` form path: `key=value&...` with NO
+   * percent-encoding (so `{{variables}}` survive) and NO type coercion (form
+   * values are always strings). Blank-key rows are skipped.
+   */
+  private buildStructuredForm(
+    fields: NonNullable<SendWebhookNodeInput['nodeData']['bodyStructured']>,
+  ): string {
+    return fields
+      .filter((f) => f.key && f.key.trim() !== '')
+      .map((f) => `${f.key}=${f.value ?? ''}`)
+      .join('&');
+  }
+
+  /**
+   * Coerce a structured row value to the JS primitive its `type` declares
+   * (EVO-1858). Mirror of the frontend `coerceJsonValue` (EVO-1742
+   * webhookBody.ts), run AFTER interpolation: a value still carrying a `{{token}}`
+   * (variable that failed to resolve) or a non-finite numeric literal stays a
+   * string rather than emitting `NaN`.
+   */
+  private coerceJsonValue(
+    value: string,
+    type: 'string' | 'number' | 'boolean',
+  ): string | number | boolean {
+    if (typeof value === 'string' && value.includes('{{')) return value;
+    if (type === 'number') {
+      const trimmed = String(value).trim();
+      if (trimmed !== '' && Number.isFinite(Number(trimmed))) {
+        return Number(trimmed);
+      }
+      return value;
+    }
+    if (type === 'boolean') {
+      if (value === 'true') return true;
+      if (value === 'false') return false;
+      return value;
+    }
+    return value;
   }
 }

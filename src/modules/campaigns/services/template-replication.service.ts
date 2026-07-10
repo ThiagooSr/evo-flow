@@ -1,22 +1,25 @@
 import { Injectable, NotFoundException } from '@nestjs/common';
-import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { CampaignTemplate } from '../entities/campaign-template.entity';
 import { MessageTemplate } from '../../../shared/entities/message-template.entity';
+import { TenantDbContext } from '../../../evo-extension-points';
 
 export interface TemplateConfig {
   messageTemplateId: string;
-  variant?: string;  // 'A', 'B', 'C' for A/B testing
+  variant?: string; // 'A', 'B', 'C' for A/B testing
 }
 
 @Injectable()
 export class TemplateReplicationService {
-  constructor(
-    @InjectRepository(CampaignTemplate)
-    private readonly campaignTemplateRepo: Repository<CampaignTemplate>,
-    @InjectRepository(MessageTemplate)
-    private readonly messageTemplateRepo: Repository<MessageTemplate>,
-  ) {}
+  constructor(private readonly db: TenantDbContext) {}
+
+  private get campaignTemplateRepo(): Repository<CampaignTemplate> {
+    return this.db.getRepository(CampaignTemplate);
+  }
+
+  private get messageTemplateRepo(): Repository<MessageTemplate> {
+    return this.db.getRepository(MessageTemplate);
+  }
 
   /**
    * Add multiple templates to a campaign
@@ -27,14 +30,14 @@ export class TemplateReplicationService {
     templates: TemplateConfig[],
   ): Promise<CampaignTemplate[]> {
     // Validate that the templates exist in evo-ai-crm
-    const templateIds = templates.map(t => t.messageTemplateId);
+    const templateIds = templates.map((t) => t.messageTemplateId);
     const existingTemplates = await this.messageTemplateRepo.find({
-      where: templateIds.map(id => ({ id, active: true })),
+      where: templateIds.map((id) => ({ id, active: true })),
     });
 
     if (existingTemplates.length !== templateIds.length) {
-      const foundIds = existingTemplates.map(t => t.id);
-      const missingIds = templateIds.filter(id => !foundIds.includes(id));
+      const foundIds = existingTemplates.map((t) => t.id);
+      const missingIds = templateIds.filter((id) => !foundIds.includes(id));
       throw new NotFoundException(
         `Some message templates not found or inactive: ${missingIds.join(', ')}`,
       );

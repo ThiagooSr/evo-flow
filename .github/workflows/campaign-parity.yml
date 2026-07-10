@@ -1,0 +1,52 @@
+name: campaign parity suite
+
+# Campaign dispatch regression gate. Introduced as the 5.4 legacy-vs-new parity
+# suite (EVO-1225); story 5.5 (EVO-1227) removed the legacy
+# CampaignMessageSenderService, so the legacy half retired and this now pins the
+# NEW distributed pipeline (campaign-packer -> campaign-sender) dispatch output
+# per fixture (golden-master snapshots), so a render/payload regression is caught
+# (FR29, NFR39).
+#
+# Deterministic and fast: everything is mocked (no real HTTP, broker or DB), so
+# no service containers are needed. A regression fails the job with the
+# fixture-named snapshot diff.
+#
+# NOTE on "required check": to make this a hard merge gate, mark the `parity`
+# job as a required status check in the branch protection rules for
+# main/develop.
+
+on:
+  pull_request:
+    branches: [main, develop]
+    paths:
+      - 'src/modules/campaigns/**'
+      - 'src/runners/campaign-sender/**'
+      - 'src/runners/campaign-packer/**'
+      - 'src/shared/messaging-channels/**'
+      - 'src/shared/audience/**'
+      - '.github/workflows/campaign-parity.yml'
+  push:
+    branches: [main, develop]
+    paths:
+      - 'src/modules/campaigns/**'
+      - 'src/runners/campaign-sender/**'
+      - 'src/runners/campaign-packer/**'
+      - 'src/shared/messaging-channels/**'
+      - 'src/shared/audience/**'
+      - '.github/workflows/campaign-parity.yml'
+
+jobs:
+  parity:
+    name: legacy vs new dispatch parity (merge gate)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - name: Install dependencies
+        run: npm ci
+      - name: Run campaign parity suite
+        run: npx jest --runInBand src/modules/campaigns/parity

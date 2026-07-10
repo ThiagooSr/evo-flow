@@ -123,6 +123,12 @@ Once running, Swagger UI is available at:
 http://localhost:3334/api
 ```
 
+### Frozen event names
+
+The `event` field on `POST /api/v1/events/track` and the optional `eventName` on `POST /api/v1/events/identify` must be one of the strings in [`src/modules/events/event-names.enum.ts`](./src/modules/events/event-names.enum.ts) (`EVENT_NAMES`). Other values return HTTP 400 from the global `ValidationPipe`. The list is the contract with the CRM publisher (`lib/events/evo_flow_event_names.rb` in `evo-ai-crm-community`); a CI script (`scripts/check-event-names-sync.sh` at the monorepo root) blocks PRs that diverge.
+
+**Growing the list:** adding or removing an entry requires **three coordinated edits in the same PR**: the Ruby file, the TS file, and the `EXPECTED_COUNT` constant in `scripts/check-event-names-sync.sh`. Otherwise the sync job fails with `DIVERGENT — lists match each other but count is N (expected M)`.
+
 ---
 
 ## Configuration
@@ -170,16 +176,75 @@ AUTH_APIKEY_INTEGRATION_LOCAL=<service-to-service-token>
 
 ## Run Modes
 
-Evo Flow can run as a single process (all-in-one for development) or as separate workers (recommended for production):
+Evo Flow can run as a single process (all-in-one for development) or as separate workers (recommended for production). `RUN_MODE` is validated at boot — an invalid value fails fast with the list of valid options. For example, `RUN_MODE=foo npm run dev` exits non-zero with:
+
+```
+Error: Invalid RUN_MODE='foo'. Valid values: single, api, event-worker, segment-worker, temporal-worker, campaign-worker, campaign-packer, campaign-sender, event-receiver, event-process.
+```
+
+Unsetting `RUN_MODE` defaults to `single`; an empty string (`RUN_MODE=`) is rejected with a separate message so accidental misconfigurations don't fall back silently.
+
+Consolidated modes (production-ready today):
 
 ```bash
 npm run dev:single      # everything in one process (default for local dev)
-npm run dev:api         # HTTP API only
-npm run dev:event       # event worker (Kafka consumer)
-npm run dev:segment     # segment worker (ClickHouse computation)
-npm run dev:temporal    # Temporal worker (journey workflows)
-npm run dev:campaign    # campaign worker (audience + sender)
+npm run dev:api         # HTTP API gateway only
+npm run dev:event       # event-worker (Kafka consumer)
+npm run dev:segment     # segment-worker (ClickHouse computation)
+npm run dev:temporal    # temporal-worker (journey workflows)
+npm run dev:campaign    # campaign-worker (audience + sender)
 ```
+
+Distributed pipeline modes (EVO-1194 — names reserved, modules pending. Each one currently logs and exits 0 so docker-compose / k8s manifests can reference them):
+
+```bash
+npm run dev:campaign-packer    # campaign-packer  — audience materialization stage
+npm run dev:campaign-sender    # campaign-sender  — dispatch stage
+npm run dev:event-receiver     # event-receiver   — inbound webhook receiver
+npm run dev:event-process      # event-process    — broker-driven event processor
+```
+
+### `dev:single` and the `kill-backend` step
+
+`dev:single` is `npm run kill-backend && RUN_MODE=single npm run dev`. The
+`kill-backend` step clears leftover "production-style" backend processes
+(`node dist/main`, `node dist/main.js`, or the watch build `node … dist/main.js`)
+before Nest boots, using:
+
+```bash
+pkill -u "$(id -u)" -f '[n]ode .*dist/(src/)?main(\.js)?( |$)'
+```
+
+- The `[n]` class makes the pattern match a real `node …` process but **not** the
+  literal `[n]ode …` text in `pkill`'s own command line — so the script does not kill
+  its own `sh -c` parent (this was bug EVO-1609: `dev:single` aborted with `Terminated`
+  before boot). The self-exclusion protects the immediate shell; a wrapper that echoes
+  the literal command (e.g. `set -x` / CI logs) can still match.
+- `-u "$(id -u)"` scopes the scan to your own processes — it won't kill backends owned
+  by other users or by containers sharing the host PID namespace.
+- `(src/)?` is defensive: Evo Flow's `nest build` emits `dist/main.js` (tsc strips the
+  `src/` root), but the optional branch keeps the pattern matching a `dist/src/main.js`
+  layout too (the sibling evo-campaign scaffold / a future monorepo build).
+- `main(\.js)?( |$)` blocks lookalikes such as `dist/maintenance.js` / `dist/main-old.js`.
+
+Read-only preview of what `kill-backend` would target — should list only real
+`node …dist/…main` processes, never the shell running the command:
+
+```bash
+pgrep -af '[n]ode .*dist/(src/)?main(\.js)?( |$)'
+```
+
+The ERE is regression-guarded by `npm run test:kill-backend`
+(`scripts/kill-backend-pattern.test.sh`, also run in CI via
+`.github/workflows/dev-scripts-smoke.yml`) — it asserts the pattern matches the real
+prod/Docker/dev-watch signatures and never matches its own command line.
+
+> **Caveat.** `kill-backend` targets detached `node` processes; a foreground
+> `dev:single` / `nest start --watch` session should be stopped with Ctrl-C — if it
+> keeps holding the port, the next boot can fail with `EADDRINUSE`. Separately, a
+> `RUN_MODE=single` boot may still stop further down at the missing Kafka topic
+> `journey_trigger_kafka_queue` (see EVO-1571 / EVO-1200) — that is independent of this
+> fix.
 
 ---
 
@@ -227,6 +292,61 @@ Inter-service authentication uses Bearer tokens issued by `evo-auth-service-comm
 | `GET /api/v1/campaigns` | List / create campaigns |
 | `POST /api/v1/campaigns/:id/execute` | Start campaign execution |
 | `GET /link/:shortCode` | Public redirect (click tracking) |
+
+---
+
+## Observability — logs and metrics
+
+### Structured logs
+
+Every log record is emitted as a single JSON line to stdout, so a collector
+(Loki / Datadog / `jq`) can parse it without grepping free text. Mandatory
+fields on each record:
+
+| Field | Meaning |
+|---|---|
+| `timestamp` | ISO 8601 timestamp |
+| `service` | the running `RUN_MODE` (e.g. `event-receiver`) |
+| `level` | `info` \| `warn` \| `error` \| `debug` \| `verbose` |
+| `correlationId` | request correlation id (from the `X-Correlation-Id` header, propagated via `AsyncLocalStorage`); `null` outside a request |
+| `campaignId` | present when the log relates to a campaign |
+| `msg` | the message |
+| `context` | the emitting class/component |
+
+To trace a single request end-to-end, send an `X-Correlation-Id` and filter on it:
+
+```bash
+curl -H 'X-Correlation-Id: test-123' -X POST localhost:3000/webhooks/evolution-api -d '{}'
+# then, in the service stdout:
+... | jq 'select(.correlationId == "test-123")'
+```
+
+The logger never emits PII (recipient phone, email, template body) at `info`
+level — those keys are redacted to `[REDACTED]`.
+
+### Metrics (Prometheus)
+
+Each HTTP-serving mode exposes a Prometheus scrape endpoint:
+
+```bash
+npm run dev:event-receiver   # the script already sets RUN_MODE=event-receiver
+curl localhost:3000/metrics
+```
+
+Key metrics emitted per mode (`mode` label = `RUN_MODE`):
+
+| Metric | Type | Meaning |
+|---|---|---|
+| `evo_flow_request_duration_seconds` | summary (`p50/p95/p99`) | request/processing latency |
+| `evo_flow_errors_total{category}` | counter | errors by category (→ `error_rate` via `rate()`) |
+| `evo_flow_throughput_total` | counter | units processed (→ throughput via `rate()`) |
+| `evo_flow_consumer_lag{topic}` | gauge | consumer lag per topic/queue (consumer modes only) |
+| `idempotency_hits_total` / `idempotency_misses_total` | counter | idempotency drops vs. first-sights (→ drop rate) |
+
+> `consumer_lag` is populated by modes that consume from the broker. The
+> `event-receiver` mode is a producer (it publishes webhooks), so the gauge is
+> registered but stays unset there; real per-topic values appear on consumer
+> modes (`event-process`, `campaign-sender`) once those are wired.
 
 ---
 
