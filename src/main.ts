@@ -2,15 +2,54 @@
 import * as dotenv from 'dotenv';
 dotenv.config();
 
+import { parseRunMode } from './modules/processing/config/processing.config';
+
+// Fail-fast validation BEFORE NestFactory.create (EVO-1194 AC3).
+// Throws with the full list of valid values; bubble up to the top-level
+// .catch() at the end of this file, which prints and exits non-zero.
+parseRunMode(process.env.RUN_MODE);
+
+// Stub-mode short-circuit for RUN_MODEs whose dedicated modules have not landed yet.
+// EVO-1194 introduces the names so docker-compose / k8s manifests can already
+// reference them; each downstream story wires its module in and removes the
+// matching entry from this Set. Empty since campaign-sender (EVO-1217) landed —
+// kept for the next pre-wired RUN_MODE.
+const STUB_RUN_MODES = new Set<string>([]);
+if (STUB_RUN_MODES.has(process.env.RUN_MODE ?? '')) {
+  // Structured JSON to stderr so log collectors (Loki / Datadog) ingest the
+  // stub-exit event with proper severity instead of treating it as untagged
+  // stdout noise. NestJS Logger is not available pre-NestFactory.
+  process.stderr.write(
+    JSON.stringify({
+      level: 'info',
+      service: 'evo-flow',
+      runMode: process.env.RUN_MODE,
+      msg: 'Stub mode — no module wired yet. Exiting gracefully.',
+      timestamp: new Date().toISOString(),
+    }) + '\n',
+  );
+  process.exit(0);
+}
+
 // Initialize OpenTelemetry BEFORE NestFactory if tracing is enabled
 if (process.env.OTEL_TRACES_ENABLED === 'true') {
   const { NodeSDK } = require('@opentelemetry/sdk-node');
-  const { OTLPTraceExporter } = require('@opentelemetry/exporter-trace-otlp-http');
-  const { HttpInstrumentation } = require('@opentelemetry/instrumentation-http');
-  const { ExpressInstrumentation } = require('@opentelemetry/instrumentation-express');
-  const { NestInstrumentation } = require('@opentelemetry/instrumentation-nestjs-core');
+  const {
+    OTLPTraceExporter,
+  } = require('@opentelemetry/exporter-trace-otlp-http');
+  const {
+    HttpInstrumentation,
+  } = require('@opentelemetry/instrumentation-http');
+  const {
+    ExpressInstrumentation,
+  } = require('@opentelemetry/instrumentation-express');
+  const {
+    NestInstrumentation,
+  } = require('@opentelemetry/instrumentation-nestjs-core');
   const { Resource } = require('@opentelemetry/resources');
-  const { SemanticResourceAttributes } = require('@opentelemetry/semantic-conventions');
+  const {
+    SemanticResourceAttributes,
+  } = require('@opentelemetry/semantic-conventions');
 
   const serviceName = process.env.OTEL_SERVICE_NAME || 'evo-campaign-api';
   const otlpEndpoint = process.env.OTEL_EXPORTER_OTLP_ENDPOINT;
@@ -32,15 +71,26 @@ if (process.env.OTEL_TRACES_ENABLED === 'true') {
     });
 
     sdk.start();
-    console.log(`✅ OpenTelemetry tracing initialized for Tempo: ${otlpEndpoint}`);
+    console.log(
+      `✅ OpenTelemetry tracing initialized for Tempo: ${otlpEndpoint}`,
+    );
   } else {
-    console.warn('⚠️  OTEL_EXPORTER_OTLP_ENDPOINT not set, OpenTelemetry tracing disabled');
+    console.warn(
+      '⚠️  OTEL_EXPORTER_OTLP_ENDPOINT not set, OpenTelemetry tracing disabled',
+    );
   }
 }
 
-import { NestFactory } from '@nestjs/core';
+import { NestFactory, Reflector } from '@nestjs/core';
 import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
-import { ValidationPipe, Logger, LogLevel, RequestMethod, HttpException, HttpStatus } from '@nestjs/common';
+import {
+  ValidationPipe,
+  Logger,
+  LogLevel,
+  RequestMethod,
+  HttpException,
+  HttpStatus,
+} from '@nestjs/common';
 import { HttpExceptionFilter } from './common/filters/http-exception.filter';
 import { ResponseTransformInterceptor } from './common/interceptors/response-transform.interceptor';
 import { AppFactory } from './app-factory';
@@ -54,14 +104,24 @@ import { SchedulerRegistry } from '@nestjs/schedule';
 import { DataSource } from 'typeorm';
 import { AppModule } from './app.module';
 import { CustomLoggerService } from './common/services/custom-logger.service';
+import { StructuredLoggerService } from './shared/logger/structured-logger.service';
+import { setAppContext } from './shared/app-context.holder';
+import { loadExternalExtensions } from './evo-extension-points';
+import axios from 'axios';
+import { json, raw, urlencoded } from 'express';
+import { applyCorrelationHeader } from './shared/correlation/axios-correlation.interceptor';
 
 async function bootstrap() {
+  // Propagate X-Correlation-Id on raw `axios.*` outbound calls (auth proxies,
+  // send-webhook node). axios.create() instances opt in separately.
+  applyCorrelationHeader(axios);
+
   // 🔍 DEBUG: Log environment variables BEFORE anything else
   console.log('🔍 DEBUG - Environment variables at startup:');
   console.log('  KAFKA_BROKERS:', process.env.KAFKA_BROKERS);
   console.log('  KAFKA_BROKERS_INTERNAL:', process.env.KAFKA_BROKERS_INTERNAL);
   console.log('  Current directory:', process.cwd());
-  
+
   // Override global Logger to add run mode to all logs
   CustomLoggerService.overrideGlobalLogger();
 
@@ -71,13 +131,30 @@ async function bootstrap() {
   // Use original Logger interface for bootstrap, but with custom logger underneath
   const logger = new Logger('Bootstrap');
 
+  // Register external extension-point implementations (e.g. an enterprise
+  // overlay) before the module graph is built and before the first request.
+  // No-op when EVO_EXTENSIONS_BOOTSTRAP is unset (standalone OSS run).
+  await loadExternalExtensions();
+
   // Determine which module to load based on RUN_MODE
   // Filter log levels - disable DEBUG and VERBOSE for cleaner output
   const logLevels: LogLevel[] = ['log', 'warn', 'error'];
 
   const app = await NestFactory.create(AppModule.forRoot(), {
     logger: logLevels, // Use minimal log levels instead of custom logger for cleaner output
+    // Body parsing is configured manually below (story 3.1 / EVO-1207) so the
+    // event-receiver can capture the raw webhook body and own malformed-payload
+    // handling instead of letting the default JSON parser reject it first.
+    bodyParser: false,
   });
+
+  // EVO-1829: stash the primary context so Temporal action-node activities reuse
+  // it instead of bootstrapping a second AppModule (which freezes single-mode).
+  setAppContext(app);
+
+  // Route framework + injected logs through the JSON structured logger so every
+  // record carries correlationId/service/level/timestamp (FR38, NFR32).
+  app.useLogger(app.get(StructuredLoggerService));
 
   // Migration safety guardrail in production.
   if (process.env.NODE_ENV === 'production') {
@@ -98,10 +175,36 @@ async function bootstrap() {
 
   // Only setup HTTP server if needed (not for event-processor mode)
   if (AppFactory.shouldStartHttpServer()) {
+    // Body parsing (story 3.1 / EVO-1207). bodyParser was disabled at the
+    // factory level so the webhook receiver gets a raw catch-all parser:
+    // /webhooks/* is read into a Buffer (preserved on req.rawBody for the
+    // signature check in story 3.4 and envelope assembly in story 3.2) without
+    // the JSON parser throwing on malformed input — the controller decides.
+    // Every other route keeps the standard json + urlencoded behaviour.
+    app.use(
+      '/webhooks',
+      raw({
+        type: () => true,
+        limit: '5mb',
+        verify: (req, _res, buf: Buffer) => {
+          (req as unknown as { rawBody?: Buffer }).rawBody = buf;
+        },
+      }),
+    );
+    app.use(json());
+    app.use(urlencoded({ extended: true }));
+
     // Set global API prefix for all routes
-    // RedirectController route must be explicitly excluded
+    // RedirectController and the webhook receiver are explicitly excluded —
+    // external providers post to /webhooks/<platform> with no /api/v1 prefix.
     app.setGlobalPrefix('api/v1', {
-      exclude: ['link/:shortCode'],
+      exclude: [
+        'link/:shortCode',
+        { path: 'webhooks/*splat', method: RequestMethod.POST },
+        // K8s/Cloud Run probes hit bare /health and /ready (EVO-1226).
+        { path: 'health', method: RequestMethod.GET },
+        { path: 'ready', method: RequestMethod.GET },
+      ],
     });
 
     app.useGlobalPipes(
@@ -130,8 +233,11 @@ async function bootstrap() {
       }),
     );
 
-    // Apply global response interceptor for standard format
-    app.useGlobalInterceptors(new ResponseTransformInterceptor());
+    // Apply global response interceptor for standard format. Pass Reflector so
+    // it can honor @SkipResponseTransform() (health/readiness probes — EVO-1226).
+    app.useGlobalInterceptors(
+      new ResponseTransformInterceptor(app.get(Reflector)),
+    );
 
     // Apply global exception filter for standard error format
     app.useGlobalFilters(new HttpExceptionFilter());
@@ -181,12 +287,8 @@ async function bootstrap() {
       credentials: true,
       allowedHeaders: ['Content-Type', 'Authorization'],
     });
-
-    const port = process.env.PORT ?? 3000;
-    await app.listen(port);
-
-    logger.log(`🌐 HTTP Server listening on port ${port}`);
-    logger.log(`📖 API Documentation: http://localhost:${port}/api`);
+    // NOTE: app.listen() for HTTP modes happens in the unified listener block
+    // below (shared with the pipeline worker modes that serve health probes).
   }
 
   // Workers start automatically via OnModuleInit in respective services
@@ -206,7 +308,9 @@ async function bootstrap() {
       // For temporal-worker, use ClickHouse singleton to avoid multiple instances
       if (process.env.RUN_MODE === 'temporal-worker') {
         logger.log('🔧 Using ClickHouse singleton for temporal-worker mode...');
-        const { ClickHouseSingleton } = await import('./modules/processing/clickhouse/clickhouse-singleton.service');
+        const { ClickHouseSingleton } = await import(
+          './modules/processing/clickhouse/clickhouse-singleton.service'
+        );
         await ClickHouseSingleton.getInstance();
         logger.log('✅ ClickHouse singleton initialized for temporal-worker');
       } else {
@@ -357,6 +461,20 @@ async function bootstrap() {
         error.message,
         error.stack,
       );
+    }
+  }
+
+  // Unified HTTP listener (EVO-1226). The full-API modes (single/api/event-receiver)
+  // and the pipeline worker modes (campaign-packer/sender/tracker, event-process)
+  // all open a port — the workers only to serve `/health` + `/ready` probes. For
+  // worker modes the app is already initialized above; app.listen() just binds the
+  // server (init is idempotent). Legacy workers return false and stay port-less.
+  if (AppFactory.shouldServeHttp()) {
+    const port = process.env.PORT ?? 3000;
+    await app.listen(port);
+    logger.log(`🌐 HTTP Server listening on port ${port}`);
+    if (AppFactory.shouldStartHttpServer()) {
+      logger.log(`📖 API Documentation: http://localhost:${port}/api`);
     }
   }
 

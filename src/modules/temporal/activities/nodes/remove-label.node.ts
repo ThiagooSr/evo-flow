@@ -1,4 +1,5 @@
 import { BaseNode, NodeExecutionResult } from './base.node';
+import { getAppContext } from '../../../../shared/app-context.holder';
 
 export interface RemoveLabelNodeInput {
   nodeId: string;
@@ -6,6 +7,7 @@ export interface RemoveLabelNodeInput {
   labelId: string;
   labelName?: string;
   sessionId: string;
+  journeyId?: string; // EVO-1917: resolve journey-default {{variables}} via interpolateNodeData
   nodeData: {
     labelId: string;
     nextNodeId?: string;
@@ -15,33 +17,22 @@ export interface RemoveLabelNodeInput {
 export class RemoveLabelNode extends BaseNode {
   private labelsService: any = null;
   private contactsService: any = null;
-  private appContext: any = null;
 
   constructor() {
     super('RemoveLabel');
   }
 
   private async getServices() {
-    if (!this.appContext) {
-      const { NestFactory } = await import('@nestjs/core');
-      const { AppModule } = await import('../../../../app.module');
-
-      this.appContext = await NestFactory.createApplicationContext(
-        AppModule.forRoot(),
-        {
-          logger: false,
-        },
-      );
-    }
+    const appContext = getAppContext();
 
     if (!this.labelsService) {
       const { LabelsService } = await import('../../../labels/labels.service');
-      this.labelsService = this.appContext.get(LabelsService);
+      this.labelsService = appContext.get(LabelsService);
     }
 
     if (!this.contactsService) {
       const { ContactsService } = await import('../../../contacts/contacts.service');
-      this.contactsService = this.appContext.get(ContactsService);
+      this.contactsService = appContext.get(ContactsService);
     }
 
     return {
@@ -93,7 +84,7 @@ export class RemoveLabelNode extends BaseNode {
             'RemoveLabelNode: contact not found',
             { contactId: input.contactId },
           );
-          return { labelRemoved: false, labelId: null, labelName: null } as any;
+          return { skipped: true, reason: 'contact_not_found' } as any;
         }
 
         await labelsService.removeLabel(input.contactId, labelNameOrId);
@@ -123,6 +114,9 @@ export class RemoveLabelNode extends BaseNode {
       }
     })
       .then(({ result, executionTime }) => {
+        if (result?.skipped) {
+          return this.createSkippedResult(result.reason, executionTime);
+        }
         return this.createSuccessResult(input, executionTime, {
           [`node_${input.nodeId}_label_removed`]: input.labelId,
           [`node_${input.nodeId}_label_name`]: result.labelName,

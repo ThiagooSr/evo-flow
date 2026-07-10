@@ -1,20 +1,25 @@
 import { log } from '@temporalio/activity';
-import { NestFactory } from '@nestjs/core';
-import { AppModule } from '../../../app.module';
-import { AudienceComputationService } from '../../campaigns/services/audience-computation.service';
+import type { INestApplicationContext } from '@nestjs/common';
+import { getAppContext as getHeldContext } from '../../../shared/app-context.holder';
+import { AudienceComputationService } from '../../../shared/audience/audience-computation.service';
 import { CampaignsService } from '../../campaigns/services/campaigns.service';
 import { Campaign } from '../../campaigns/entities/campaign.entity';
 import { CampaignExecution } from '../../campaigns/entities/campaign-execution.entity';
+import { CampaignContactStatus } from '../../campaigns/entities/campaign-contact.entity';
+import { runActivityInTenantDbContext } from '../tenant-activity-context';
+import {
+  IMESSAGE_BROKER,
+  IMessageBroker,
+} from '../../../shared/broker/interfaces/message-broker.interface';
+import {
+  CAMPAIGNS_PACK_TOPIC,
+  CampaignsPackContract,
+} from '../../../shared/broker/contracts/campaigns-pack.contract';
 
-let appContext: any = null;
-
+// EVO-1829: reuse the primary app context (stashed at boot) instead of
+// bootstrapping a second AppModule, which freezes single-mode.
 async function getAppContext() {
-  if (!appContext) {
-    appContext = await NestFactory.createApplicationContext(AppModule.forRoot(), {
-      logger: false,
-    });
-  }
-  return appContext;
+  return getHeldContext();
 }
 
 // ==================== Input/Output Interfaces ====================
@@ -68,9 +73,21 @@ export interface GetCampaignDataInput {
   campaignId: string;
 }
 
+export interface PublishCampaignsPackInput {
+  campaignId: string;
+  correlationId: string;
+}
+
 export interface UpdateExecutionProgressInput {
   campaignId: string;
   workflowId: string;
+  /**
+   * Tenant the workflow belongs to (ADR14, story 10.1b). Propagated from the
+   * workflow payload so the activity's DB write is scoped by RLS. Optional for
+   * single-tenant (resolves to DEFAULT_TENANT_ID); under multi-tenant a missing
+   * value makes the activity fail explicitly rather than run unscoped.
+   */
+  tenantId?: string | null;
   status?: 'running' | 'paused' | 'completed' | 'failed' | 'cancelled';
   totalContacts?: number;
   processedContacts?: number;
@@ -97,6 +114,8 @@ export interface CampaignExecutionActivities {
   updateCampaignStatus(input: UpdateCampaignStatusInput): Promise<void>;
 
   getCampaignData(input: GetCampaignDataInput): Promise<Campaign>;
+
+  publishCampaignsPack(input: PublishCampaignsPackInput): Promise<void>;
 
   updateExecutionProgress(input: UpdateExecutionProgressInput): Promise<void>;
 
@@ -216,7 +235,9 @@ export async function getCampaignBatch(
       .andWhere('cc.batchSequence = :batchNumber', {
         batchNumber: input.batchNumber,
       })
-      .andWhere('cc.status = :status', { status: 'pending' })
+      .andWhere('cc.status = :status', {
+        status: CampaignContactStatus.PENDING,
+      })
       .getMany();
 
     log.debug('Campaign batch retrieved', {
@@ -347,7 +368,7 @@ export async function markBatchAsProcessed(
       .createQueryBuilder()
       .update()
       .set({
-        status: 'sent',
+        status: CampaignContactStatus.SENT,
         sentAt: new Date(),
       })
       .where('campaignId = :campaignId', { campaignId })
@@ -372,9 +393,6 @@ export async function updateExecutionProgress(
   input: UpdateExecutionProgressInput,
 ): Promise<void> {
   try {
-    const app = await getAppContext();
-    const dataSource = app.get('DataSource');
-
     const updates: Record<string, any> = {};
     if (input.status !== undefined) updates.status = input.status;
     if (input.totalContacts !== undefined) updates.totalContacts = input.totalContacts;
@@ -388,12 +406,19 @@ export async function updateExecutionProgress(
       updates.endedAt = new Date();
     }
 
-    await dataSource.getRepository(CampaignExecution).update(
-      {
-        campaignId: input.campaignId,
-        workflowId: input.workflowId,
-      },
-      updates,
+    // Reference wiring (ADR14, story 10.1b): scope the activity's DB write to the
+    // workflow's tenant via the seam. Uses the handed EntityManager so the UPDATE
+    // runs on the connection carrying app.current_tenant_id (enterprise), or the
+    // global pool (community / single-tenant). A missing tenant under multi-tenant
+    // throws here instead of writing across tenants.
+    await runActivityInTenantDbContext(input.tenantId, (manager) =>
+      manager.getRepository(CampaignExecution).update(
+        {
+          campaignId: input.campaignId,
+          workflowId: input.workflowId,
+        },
+        updates,
+      ),
     );
   } catch (error) {
     log.error('Failed to update campaign execution progress', {
@@ -405,6 +430,42 @@ export async function updateExecutionProgress(
   }
 }
 
+/**
+ * Switch-flip of the distributed campaign pipeline (story 4.7 / EVO-1221):
+ * publishes a single `campaigns.pack` message and returns once the broker
+ * acks, handing the heavy lifting (audience, pagination, dispatch, tracking)
+ * to the packer/sender/tracker workers. Replaced the former inline dispatch
+ * (the CampaignMessageSenderService batch loop, removed in story 5.5 / EVO-1227).
+ *
+ * `triggeredBy` is fixed to `'schedule'`: the landed contract enum
+ * (`campaigns-pack.contract.ts`, story 1.5) is `schedule|manual|recurrence`
+ * and the packer only reads `campaignId`/`correlationId`, so the field is
+ * pure provenance — the Temporal trigger fires when the campaign schedule
+ * expires. A broker error propagates so Temporal applies the activity proxy's
+ * default retry policy (the broker is the fault, not the workflow).
+ */
+export async function publishCampaignsPack(
+  input: PublishCampaignsPackInput,
+): Promise<void> {
+  const { campaignId, correlationId } = input;
+
+  log.info('Publishing campaigns.pack', { campaignId, correlationId });
+
+  const app = (await getAppContext()) as INestApplicationContext;
+  const broker = app.get<IMessageBroker>(IMESSAGE_BROKER);
+
+  const payload: CampaignsPackContract = {
+    campaignId,
+    triggeredAt: new Date().toISOString(),
+    triggeredBy: 'schedule',
+    correlationId,
+  };
+
+  await broker.publish(CAMPAIGNS_PACK_TOPIC, payload);
+
+  log.info('campaigns.pack published', { campaignId, correlationId });
+}
+
 // Export activities object for worker registration
 export const campaignExecutionActivities: CampaignExecutionActivities = {
   computeCampaignAudience,
@@ -412,6 +473,7 @@ export const campaignExecutionActivities: CampaignExecutionActivities = {
   getCampaignBatch,
   updateCampaignStatus,
   getCampaignData,
+  publishCampaignsPack,
   updateExecutionProgress,
   markBatchAsProcessed,
 };

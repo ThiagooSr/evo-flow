@@ -1,8 +1,8 @@
 import { Injectable, Optional } from '@nestjs/common';
-import { InjectRepository } from '@nestjs/typeorm';
 import { Repository, IsNull, Not } from 'typeorm';
 import { EventEmitter2 } from '@nestjs/event-emitter';
 import { Segment } from '../entities/segment.entity';
+import { TenantDbContext } from '../../../evo-extension-points';
 import { ModularSegmentComputationService } from './modular-segment-computation.service';
 import { ClickHouseService } from '../../processing/clickhouse/clickhouse.service';
 import { SegmentDistributedJobService } from './segment-distributed-job.service';
@@ -24,14 +24,17 @@ export class SegmentComputationService {
   );
 
   constructor(
-    @InjectRepository(Segment)
-    private segmentRepository: Repository<Segment>,
+    private readonly db: TenantDbContext,
     private modularComputationService: ModularSegmentComputationService,
     private clickhouseService: ClickHouseService,
     private segmentCacheService: SegmentCacheService,
     private eventEmitter: EventEmitter2,
     @Optional() private distributedJobService?: SegmentDistributedJobService,
   ) {}
+
+  private get segmentRepository(): Repository<Segment> {
+    return this.db.getRepository(Segment);
+  }
 
   private isDistributedProcessingEnabled(): boolean {
     return process.env.ENABLE_DISTRIBUTED_PROCESSING === 'true';
@@ -277,7 +280,9 @@ export class SegmentComputationService {
       this.logger.error(
         `Error getting segment contacts from ClickHouse for segment ${segmentId}: ${error.message}`,
       );
-      return [];
+      // Propagate instead of returning [] silently: a ClickHouse failure here
+      // must not be indistinguishable from a genuinely empty segment.
+      throw error;
     }
   }
 
@@ -302,7 +307,8 @@ export class SegmentComputationService {
       return result.map((row: any) => row.segmentId);
     } catch (error: any) {
       this.logger.error(`Error getting contact segments: ${error.message}`);
-      return [];
+      // Propagate: a ClickHouse failure must not look like "contact in no segment".
+      throw error;
     }
   }
 
@@ -332,7 +338,8 @@ export class SegmentComputationService {
       return results.length > 0 ? results[0].inSegment : false;
     } catch (error: any) {
       this.logger.error(`Error checking segment assignment: ${error.message}`);
-      return false;
+      // Propagate: a ClickHouse failure must not be silently treated as "not in segment".
+      throw error;
     }
   }
 

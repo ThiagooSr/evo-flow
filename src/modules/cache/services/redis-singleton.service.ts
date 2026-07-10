@@ -42,6 +42,7 @@ class RedisSingleton {
       port: config.redis?.port || 6379,
       password: config.redis?.password,
       db: config.redis?.db || 5,
+      ...(config.redis?.tls ? { tls: config.redis.tls } : {}),
       maxRetriesPerRequest: 3,
       enableReadyCheck: true,
       lazyConnect: true,

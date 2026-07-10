@@ -4,6 +4,7 @@ dotenv.config();
 
 import { QueueMode, RunMode } from '../enums';
 import { WriteMode } from '../enums/write-mode.enum';
+import { TEMPORAL_TASK_QUEUES } from '../../temporal/temporal-task-queues.constants';
 
 export interface ProcessingConfig {
   runMode: RunMode;
@@ -17,6 +18,10 @@ export interface ProcessingConfig {
     password?: string;
     db?: number;
     queueName: string;
+    // TLS: derivado de REDIS_SSL=true (managed Redis/Valkey TLS-only, ex. DigitalOcean
+    // porta 25061). Quando setado, os clientes ioredis devem espalhar `tls: this`.
+    // Objeto vazio = TLS com defaults (suficiente p/ DO Valkey). undefined = sem TLS.
+    tls?: Record<string, never>;
   };
 
   // Configurações RabbitMQ
@@ -79,11 +84,42 @@ export interface ProcessingConfig {
     namespace?: string;
     taskQueue?: string;
     workflowTimeoutMs?: number;
+    // EVO-1764 journey-execution queue-health detection + fail-fast guard.
+    // How often the poller calls describeTaskQueue (ms).
+    queuePollIntervalMs: number;
+    // Sustained zero-WORKFLOW-pollers duration before the readiness indicator
+    // flips `down` (ms). Sustained (not instantaneous) so a benign Temporal
+    // restart — from which the worker auto-recovers (EVO-1758) — does not flap.
+    zeroPollerSustainedMs: number;
+    // Sustained Temporal-unreachable duration before the separate
+    // `temporal-connectivity` readiness indicator flips `down` (ms). Sustained
+    // (not a single failed poll) so a benign restart the worker auto-recovers
+    // from (EVO-1758) does not 503 /ready and risk LB eviction (EVO-1859).
+    temporalUnreachableSustainedMs: number;
+    // Grace window the dispatch guard tolerates before failing a triggered
+    // journey as unexecutable (ms). Shorter than the indicator threshold.
+    dispatchGraceMs: number;
   };
 }
 
+export function parseRunMode(raw: string | undefined): RunMode {
+  if (raw === undefined) return RunMode.SINGLE;
+  if (raw === '') {
+    throw new Error(
+      'RUN_MODE is set to an empty string. Unset the variable to use the default (single) or set a valid value.',
+    );
+  }
+  const valid: readonly string[] = Object.values(RunMode);
+  if (!valid.includes(raw)) {
+    throw new Error(
+      `Invalid RUN_MODE='${raw}'. Valid values: ${valid.join(', ')}.`,
+    );
+  }
+  return raw as RunMode;
+}
+
 export function getProcessingConfig(): ProcessingConfig {
-  const runMode = (process.env.RUN_MODE as RunMode) || RunMode.SINGLE;
+  const runMode = parseRunMode(process.env.RUN_MODE);
   const queueMode = (process.env.QUEUE_MODE as QueueMode) || QueueMode.KAFKA;
   const writeMode = (process.env.WRITE_MODE as WriteMode) || WriteMode.KAFKA;
 
@@ -99,6 +135,9 @@ export function getProcessingConfig(): ProcessingConfig {
       password: process.env.REDIS_PASSWORD,
       db: parseInt(process.env.REDIS_DB || '5'),
       queueName: process.env.REDIS_QUEUE_NAME || 'evo-campaign-events',
+      // TLS-only managed Redis (REDIS_SSL=true) exige tls; sem isto o handshake é
+      // derrubado (ECONNRESET) — era o que travava o readiness/RedisHealthIndicator.
+      tls: process.env.REDIS_SSL === 'true' ? {} : undefined,
     },
 
     // RabbitMQ config
@@ -126,8 +165,10 @@ export function getProcessingConfig(): ProcessingConfig {
         retentionMs: process.env.KAFKA_TOPIC_RETENTION_MS || '86400000',
         retentionBytes:
           process.env.KAFKA_TOPIC_RETENTION_BYTES || '64424509440',
-        compressionType:
-          process.env.KAFKA_TOPIC_COMPRESSION_TYPE || 'zstd',
+        // kafkajs (^2.2.4) only decodes gzip natively; zstd/snappy need a
+        // registered codec (zstd's is a native build that doesn't ship here),
+        // so a zstd topic crashes the kafkajs consumers on fetch (EVO-1727).
+        compressionType: process.env.KAFKA_TOPIC_COMPRESSION_TYPE || 'gzip',
         maxMessageBytes:
           process.env.KAFKA_TOPIC_MAX_MESSAGE_BYTES || '10485760',
       },
@@ -170,10 +211,25 @@ export function getProcessingConfig(): ProcessingConfig {
     temporal: {
       serverAddress: process.env.TEMPORAL_ADDRESS || 'localhost:7233',
       namespace: process.env.TEMPORAL_NAMESPACE || 'default',
-      taskQueue: process.env.TEMPORAL_TASK_QUEUE || 'journey-execution',
+      taskQueue:
+        process.env.TEMPORAL_TASK_QUEUE ||
+        TEMPORAL_TASK_QUEUES.JOURNEY_EXECUTION,
       workflowTimeoutMs: parseInt(
         process.env.TEMPORAL_WORKFLOW_TIMEOUT || '300000',
       ), // 5 minutes
+      // EVO-1764 queue-health thresholds.
+      queuePollIntervalMs: parseInt(
+        process.env.TEMPORAL_QUEUE_POLL_INTERVAL_MS || '15000',
+      ),
+      zeroPollerSustainedMs: parseInt(
+        process.env.TEMPORAL_ZERO_POLLER_SUSTAINED_MS || '60000',
+      ),
+      temporalUnreachableSustainedMs: parseInt(
+        process.env.TEMPORAL_UNREACHABLE_SUSTAINED_MS || '60000',
+      ),
+      dispatchGraceMs: parseInt(
+        process.env.TEMPORAL_DISPATCH_GRACE_MS || '45000',
+      ),
     },
   };
 }

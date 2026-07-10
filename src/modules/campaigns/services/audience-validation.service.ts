@@ -1,9 +1,9 @@
 import { Injectable, Logger } from '@nestjs/common';
-import { InjectRepository } from '@nestjs/typeorm';
 import { Repository, In } from 'typeorm';
 import { Campaign } from '../entities/campaign.entity';
 import { CampaignContact } from '../entities/campaign-contact.entity';
-import { SegmentQueryBuilderService } from './segment-query-builder.service';
+import { TenantDbContext } from '../../../evo-extension-points';
+import { SegmentQueryBuilderService } from '../../../shared/audience/segment-query-builder.service';
 import { ContactsClientService } from '../../../shared/crm-client/contacts-client.service';
 import {
   mapContactDto,
@@ -48,13 +48,18 @@ export class AudienceValidationService {
   private readonly logger = new Logger(AudienceValidationService.name);
 
   constructor(
-    @InjectRepository(Campaign)
-    private readonly campaignRepository: Repository<Campaign>,
-    @InjectRepository(CampaignContact)
-    private readonly campaignContactRepository: Repository<CampaignContact>,
+    private readonly db: TenantDbContext,
     private readonly segmentQueryBuilder: SegmentQueryBuilderService,
     private readonly contactsClient: ContactsClientService,
   ) {}
+
+  private get campaignRepository(): Repository<Campaign> {
+    return this.db.getRepository(Campaign);
+  }
+
+  private get campaignContactRepository(): Repository<CampaignContact> {
+    return this.db.getRepository(CampaignContact);
+  }
 
   /**
    * Validate entire campaign audience
@@ -358,9 +363,7 @@ export class AudienceValidationService {
   /**
    * Categorize validation issue type from reason string
    */
-  private categorizeValidationIssue(
-    reason?: string,
-  ): ValidationIssue['type'] {
+  private categorizeValidationIssue(reason?: string): ValidationIssue['type'] {
     if (!reason) {
       return 'missing_field';
     }
@@ -415,16 +418,12 @@ export class AudienceValidationService {
   async removeInvalidContacts(
     campaignId: string,
   ): Promise<{ removed: number }> {
-    this.logger.log(
-      `Removing invalid contacts from campaign ${campaignId}`,
-    );
+    this.logger.log(`Removing invalid contacts from campaign ${campaignId}`);
 
     const validation = await this.validateAudience(campaignId);
 
     if (validation.issues.length === 0) {
-      this.logger.log(
-        `No invalid contacts found for campaign ${campaignId}`,
-      );
+      this.logger.log(`No invalid contacts found for campaign ${campaignId}`);
       return { removed: 0 };
     }
 

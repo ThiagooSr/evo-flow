@@ -1,9 +1,23 @@
 import { BaseNode, NodeExecutionResult } from './base.node';
 
+const CONVERSATION_FIELD_PATTERN = /\{\{conversation\.([^}]+)\}\}/;
+const CONTACT_FIELD_PATTERN = /\{\{contact\.([^}]+)\}\}/;
+
+// Picker-facing contact field names that differ from the loaded
+// `HydratedContact` shape. The field picker offers `{{contact.phone}}`, but the
+// hydrated contact exposes `phoneNumber` — map the leading segment so the
+// offered field actually resolves. Only the head segment is aliased, so nested
+// paths like `customAttributes.<key>` are untouched.
+const CONTACT_FIELD_ALIASES: Record<string, string> = {
+  phone: 'phoneNumber',
+};
+
 export interface ConditionalNodeInput {
   nodeId: string;
   contactId: string;
+  conversationId?: string;
   sessionId: string;
+  journeyId?: string; // EVO-1917: resolve journey-default {{variables}} in condition values via interpolateNodeData
   nodeData: {
     paths: Array<{
       id: string;
@@ -53,8 +67,37 @@ export class ConditionalNode extends BaseNode {
         throw new Error('No conditional paths configured');
       }
 
-      // Load contact data for evaluation
-      const contactData = await this.loadContactData(input.contactId);
+      // Load contact data only when a condition actually needs the contact —
+      // either a {{contact.*}} field (resolved by field pattern regardless of
+      // type, mirroring evaluateCondition) or a `type: 'contact'` condition.
+      // Avoids a CRM round-trip on Conditional nodes that only read session
+      // variables. Empty object when out of scope: resolveContactField then
+      // returns undefined for every field, the correct "no match" signal.
+      const needsContactData = paths.some((path) =>
+        (path.conditions || []).some(
+          (condition) =>
+            condition?.type === 'contact' ||
+            (typeof condition?.field === 'string' &&
+              CONTACT_FIELD_PATTERN.test(condition.field)),
+        ),
+      );
+      const contactData = needsContactData
+        ? await this.loadContactData(input.contactId)
+        : {};
+
+      // Load conversation data only when a path actually references a
+      // {{conversation.*}} field — avoids a CRM round-trip on every Conditional
+      // node that does not need it. Null when out of scope or unavailable.
+      const needsConversationData = paths.some((path) =>
+        (path.conditions || []).some(
+          (condition) =>
+            typeof condition.field === 'string' &&
+            CONVERSATION_FIELD_PATTERN.test(condition.field),
+        ),
+      );
+      const conversationData = needsConversationData
+        ? await this.loadConversationData(input.conversationId)
+        : null;
 
       // Load session variables
       const sessionVariables = await this.loadSessionVariables(input.sessionId);
@@ -73,6 +116,7 @@ export class ConditionalNode extends BaseNode {
         const pathResult = await this.evaluatePath(
           path,
           contactData,
+          conversationData,
           sessionVariables,
           input,
         );
@@ -145,6 +189,7 @@ export class ConditionalNode extends BaseNode {
   private async evaluatePath(
     path: any,
     contactData: any,
+    conversationData: any,
     sessionVariables: Record<string, any>,
     input: ConditionalNodeInput,
   ): Promise<{ matched: boolean; evaluationTime: number }> {
@@ -160,6 +205,7 @@ export class ConditionalNode extends BaseNode {
       const result = await this.evaluateCondition(
         condition,
         contactData,
+        conversationData,
         sessionVariables,
         input,
       );
@@ -185,10 +231,28 @@ export class ConditionalNode extends BaseNode {
   private async evaluateCondition(
     condition: any,
     contactData: any,
+    conversationData: any,
     sessionVariables: Record<string, any>,
     input: ConditionalNodeInput,
   ): Promise<boolean> {
     const { type, field, operator, value } = condition;
+
+    // Conversation fields ({{conversation.*}}) are resolved against the live
+    // conversation regardless of the condition `type`, since the field is
+    // selected as a system variable rather than tied to a dedicated type.
+    if (typeof field === 'string' && CONVERSATION_FIELD_PATTERN.test(field)) {
+      const stageIds = this.resolveConversationField(field, conversationData);
+      return this.compareConversationStage(stageIds, operator, value);
+    }
+
+    // Contact fields ({{contact.*}}, including customAttributes.*) resolve
+    // against the loaded contact regardless of the condition `type` — the
+    // field can be selected from the shared field picker on any condition
+    // type (mirrors the conversation case above).
+    if (typeof field === 'string' && CONTACT_FIELD_PATTERN.test(field)) {
+      const fieldValue = this.resolveContactField(field, contactData);
+      return this.compareValues(fieldValue, operator, value);
+    }
 
     // Resolve field value based on type
     let fieldValue: any;
@@ -253,18 +317,100 @@ export class ConditionalNode extends BaseNode {
   }
 
   /**
-   * Resolve contact field value
+   * Resolve contact field value. Supports nested dot paths so
+   * `{{contact.customAttributes.<attribute_key>}}` reads from the loaded
+   * contact's `customAttributes` map (single-level fields like `email` /
+   * `name` / `identifier` keep resolving unchanged). The leading segment is
+   * run through CONTACT_FIELD_ALIASES so picker names that differ from the
+   * hydrated shape (e.g. `phone` → `phoneNumber`) resolve correctly.
    */
   private resolveContactField(field: string, contactData: any): any {
-    // Handle {{contact.field}} format
-    const match = field.match(/\{\{contact\.([^}]+)\}\}/);
-    if (match) {
-      const fieldName = match[1];
-      return contactData?.[fieldName];
+    // Handle {{contact.field}} / {{contact.customAttributes.key}} format
+    const match = field.match(CONTACT_FIELD_PATTERN);
+    const rawPath = match ? match[1] : field;
+
+    const [head, ...rest] = rawPath.split('.');
+    const path = [CONTACT_FIELD_ALIASES[head] ?? head, ...rest].join('.');
+
+    return this.resolveNestedPath(contactData, path);
+  }
+
+  /**
+   * Walk a dot-delimited path against an object (e.g.
+   * "customAttributes.plan_interest"). Returns undefined if any segment is
+   * missing. NOTE: unlike set-variable.node.ts (which preserves the literal
+   * {{token}} on a miss), this returns undefined — the correct "no match"
+   * signal for compareValues' null short-circuit.
+   */
+  private resolveNestedPath(obj: unknown, path: string): unknown {
+    return path
+      .split('.')
+      .reduce<unknown>(
+        (acc, part) =>
+          acc != null && typeof acc === 'object'
+            ? (acc as Record<string, unknown>)[part]
+            : undefined,
+        obj,
+      );
+  }
+
+  /**
+   * Resolve a {{conversation.*}} field against the live conversation payload.
+   *
+   * Currently supports `pipeline_stage_id`: returns the ids of the conversation's
+   * current pipeline stage(s). A conversation can sit in more than one pipeline
+   * (`pipeline_items` is has_many), so this returns every current stage id —
+   * membership is decided by `compareConversationStage`. Returns an empty array
+   * when there is no conversation or no pipeline item (null-safety).
+   */
+  private resolveConversationField(
+    field: string,
+    conversationData: any,
+  ): string[] {
+    const match = field.match(CONVERSATION_FIELD_PATTERN);
+    const fieldName = match?.[1];
+
+    if (fieldName === 'pipeline_stage_id') {
+      const pipelines = conversationData?.pipelines;
+      if (!Array.isArray(pipelines)) return [];
+
+      return pipelines
+        .flatMap((pipeline: any) =>
+          Array.isArray(pipeline?.stages) ? pipeline.stages : [],
+        )
+        .map((stage: any) => stage?.id)
+        .filter((id: any): id is string => typeof id === 'string');
     }
 
-    // Direct field access
-    return contactData?.[field];
+    this.logger.warn('Unsupported conversation field', { field });
+    return [];
+  }
+
+  /**
+   * Compare the conversation's current stage id(s) against the selected stage.
+   * When the conversation has no stage (empty array), every operator resolves
+   * to false so an unknown/absent stage never matches and never crashes.
+   */
+  private compareConversationStage(
+    stageIds: string[],
+    operator: string,
+    expectedValue: any,
+  ): boolean {
+    // No target stage selected or no current stage → never match (conservative).
+    if (!expectedValue || !stageIds.length) return false;
+
+    const expected = String(expectedValue);
+    switch (operator) {
+      case 'equals':
+        return stageIds.includes(expected);
+      case 'not_equals':
+        return !stageIds.includes(expected);
+      default:
+        this.logger.warn('Unsupported operator for conversation stage', {
+          operator,
+        });
+        return false;
+    }
   }
 
   /**
@@ -368,9 +514,21 @@ export class ConditionalNode extends BaseNode {
     operator: string,
     expectedValue: any,
   ): boolean {
-    // Handle null/undefined values
+    // Handle null/undefined values. A missing value IS empty, so the
+    // emptiness operators must answer from that fact rather than falling
+    // through to the generic "no match" (which would wrongly report a
+    // missing contact custom attribute as non-empty).
     if (fieldValue == null) {
-      return operator === 'not_equals' ? expectedValue != null : false;
+      switch (operator) {
+        case 'is_empty':
+          return true;
+        case 'is_not_empty':
+          return false;
+        case 'not_equals':
+          return expectedValue != null;
+        default:
+          return false;
+      }
     }
 
     // Convert to strings for comparison
@@ -469,13 +627,53 @@ export class ConditionalNode extends BaseNode {
 
       const client = new ContactsClientService(new CrmClientService());
       const dto = await client.findById(contactId);
+      // A successful fetch may legitimately carry no attributes — that empty
+      // mapping is a valid "no match" signal and must NOT be treated as failure.
       return mapContactDto(dto) || {};
     } catch (error: any) {
-      this.logger.warn('Failed to load contact data', {
+      // EVO-1913: a CRM/hydration failure is NOT the same as "contact has no
+      // such attribute". Swallowing it as `{}` made every contact-attribute
+      // condition evaluate false → silent route to ELSE with no error. Surface
+      // it instead: log ERROR and re-throw so the node fails visibly (the
+      // executor records node_failed + telemetry) rather than mis-routing.
+      this.logger.error('Failed to load contact data for condition evaluation', {
         contactId,
         error: error.message,
       });
-      return {};
+      throw new Error(`Failed to load contact data: ${error.message}`);
+    }
+  }
+
+  /**
+   * Load conversation data from the CRM for evaluating {{conversation.*}}
+   * fields. Returns null when there is no conversation in scope (e.g. a
+   * contact-triggered journey) or when the request fails, so callers degrade
+   * to a non-matching condition instead of crashing.
+   */
+  private async loadConversationData(conversationId?: string): Promise<any> {
+    if (!conversationId) return null;
+
+    try {
+      const { CrmClientService } = await import(
+        '../../../../shared/crm-client/crm-client.service'
+      );
+
+      const client = new CrmClientService();
+      const response = await client.getConversation({ conversationId });
+      // conversations#show returns a success_response envelope ({ success, data, meta })
+      // and executeRequest stores the raw body as `data`, so the conversation
+      // (with pipelines) sits one level deeper at response.data.data.
+      return response?.data?.data ?? null;
+    } catch (error: any) {
+      // EVO-1913: a request failure here is not a benign "no conversation in
+      // scope" (that case returns early above with no error). Make the failure
+      // visible at ERROR level; we still degrade to null so a contact-triggered
+      // journey keeps evaluating, but the cause is no longer invisible.
+      this.logger.error('Failed to load conversation data', {
+        conversationId,
+        error: error.message,
+      });
+      return null;
     }
   }
 
@@ -498,7 +696,11 @@ export class ConditionalNode extends BaseNode {
 
       return session?.variables || {};
     } catch (error: any) {
-      this.logger.warn('Failed to load session variables', {
+      // EVO-1913: surface the failure at ERROR level instead of swallowing it
+      // as an empty bag silently (which made {{session var}} conditions all
+      // evaluate false with no trace). Degrade to {} so evaluation continues,
+      // but the cause is now visible in the logs.
+      this.logger.error('Failed to load session variables', {
         sessionId,
         error: error.message,
       });

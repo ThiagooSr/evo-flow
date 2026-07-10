@@ -23,9 +23,14 @@ export class LabelTrigger extends BaseTrigger {
       triggerConditions: trigger.conditions,
     });
 
-    // Check if it's a label event (label_added or label_removed)
-    const isLabelEvent =
-      event.eventName === 'label_added' || event.eventName === 'label_removed';
+    // The CRM emits `contact.label.added` / `contact.label.removed`; older
+    // producers used the short `label_added` / `label_removed`. Accept both.
+    const isLabelEvent = [
+      'label_added',
+      'label_removed',
+      'contact.label.added',
+      'contact.label.removed',
+    ].includes(event.eventName);
 
     if (!isLabelEvent) {
       const result: TriggerMatchResult = {
@@ -53,10 +58,13 @@ export class LabelTrigger extends BaseTrigger {
       return result;
     }
 
-    // Parse event properties to get the label ID from the event
+    // `contact.label.added` is an `identify` event, so the label payload lands
+    // in `traits`, not `properties`. Read both and fall back to traits.
     let eventProperties: Record<string, any> = {};
+    let eventTraits: Record<string, any> = {};
     try {
       eventProperties = JSON.parse(event.properties || '{}');
+      eventTraits = JSON.parse(event.traits || '{}');
     } catch (error) {
       const result: TriggerMatchResult = {
         matches: false,
@@ -66,8 +74,8 @@ export class LabelTrigger extends BaseTrigger {
       return result;
     }
 
-    const eventLabelId = eventProperties.labelId;
-    const eventLabelName = eventProperties.labelName;
+    const eventLabelId = eventProperties.labelId ?? eventTraits.labelId;
+    const eventLabelName = eventProperties.labelName ?? eventTraits.labelName;
 
     if (!eventLabelId) {
       const result: TriggerMatchResult = {
@@ -88,6 +96,26 @@ export class LabelTrigger extends BaseTrigger {
       const result: TriggerMatchResult = {
         matches: false,
         reason: `Label mismatch: event labelId="${eventLabelId}" labelName="${eventLabelName}" !== target="${targetLabelId}"`,
+      };
+      this.logMatch(event, journey, result);
+      return result;
+    }
+
+    // EVO-1763: honor the configured action. Fire only on the event matching
+    // labelAction (applied ↔ *added, removed ↔ *removed). Triggers persisted
+    // before the action was sent default to 'applied' (the editor/canvas default).
+    const configuredAction: 'applied' | 'removed' =
+      config.labelAction || trigger.conditions?.labelAction || 'applied';
+    const eventIsApplied =
+      event.eventName === 'label_added' ||
+      event.eventName === 'contact.label.added';
+    const actionMatches =
+      configuredAction === 'applied' ? eventIsApplied : !eventIsApplied;
+
+    if (!actionMatches) {
+      const result: TriggerMatchResult = {
+        matches: false,
+        reason: `Label action mismatch: event "${event.eventName}" does not match configured action "${configuredAction}"`,
       };
       this.logMatch(event, journey, result);
       return result;

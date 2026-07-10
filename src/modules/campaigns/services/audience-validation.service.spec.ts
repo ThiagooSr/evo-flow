@@ -1,4 +1,6 @@
 import { AudienceValidationService } from './audience-validation.service';
+import { Campaign } from '../entities/campaign.entity';
+import { TenantDbContext } from '../../../evo-extension-points';
 
 describe('AudienceValidationService', () => {
   const campaignRepository: any = {
@@ -7,6 +9,10 @@ describe('AudienceValidationService', () => {
   const campaignContactRepository: any = {
     manager: { query: jest.fn() },
   };
+  const db = {
+    getRepository: (entity: unknown) =>
+      entity === Campaign ? campaignRepository : campaignContactRepository,
+  } as unknown as TenantDbContext;
   const segmentQueryBuilder: any = {
     analyzeSegmentationStrategy: jest.fn(),
     executeAudienceQuery: jest.fn(),
@@ -17,8 +23,7 @@ describe('AudienceValidationService', () => {
   };
 
   const service = new AudienceValidationService(
-    campaignRepository,
-    campaignContactRepository,
+    db,
     segmentQueryBuilder,
     contactsClient,
   );

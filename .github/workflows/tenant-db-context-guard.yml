@@ -1,0 +1,23 @@
+name: tenant-db-context guard
+
+# Anti-forgetting guard for the tenant DB-context seam (ADR14, story 10.1b, AC4).
+# Fails the build when a tenant-scoped table is reached through the global pool
+# (@InjectRepository / AppDataSource.getRepository) instead of the TenantDbContext
+# seam, outside the documented allowlist. See scripts/check-tenant-db-context.mjs.
+
+on:
+  pull_request:
+    branches: [main, develop]
+  push:
+    branches: [main, develop]
+
+jobs:
+  tenant-db-context:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Enforce tenant DB-context seam
+        run: node scripts/check-tenant-db-context.mjs

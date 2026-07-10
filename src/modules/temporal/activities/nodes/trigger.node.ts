@@ -16,6 +16,8 @@ export interface TriggerNodeInput {
     eventName: string;
     eventType: string;
     properties: Record<string, any>;
+    // identify-DTO payload (custom attribute, label) rides in traits (EVO-1839).
+    traits?: Record<string, any>;
     timestamp: string;
   };
   nodeData: {
@@ -122,6 +124,10 @@ export class TriggerNode extends BaseNode {
             triggerVariables[`event_${key}`] = value;
           }
         }
+        // NOTE: traits flattening intentionally lives only in the `.then()` block
+        // below — that is the block whose variables are actually returned via
+        // createSuccessResult. This `triggerVariables` object is not returned, so
+        // mirroring traits here would be dead code (EVO-1839 review F2).
       }
 
       this.logger.log('Trigger node completed', {
@@ -152,7 +158,9 @@ export class TriggerNode extends BaseNode {
           allVariables[`trigger_event_name`] = result.triggerEvent.eventName;
           allVariables[`trigger_event_type`] = result.triggerEvent.eventType;
           allVariables[`event_name`] = result.triggerEvent.eventName;
-          allVariables[`event_value`] = result.triggerEvent.properties?.value;
+          allVariables[`event_value`] =
+            result.triggerEvent.properties?.value ??
+            result.triggerEvent.traits?.value;
 
           // Add event properties as flattened variables
           if (result.triggerEvent.properties) {
@@ -160,6 +168,17 @@ export class TriggerNode extends BaseNode {
               result.triggerEvent.properties,
             )) {
               allVariables[`event_${key}`] = value;
+            }
+          }
+          // identify-DTO payloads ride in traits — flatten them too, without
+          // clobbering any property of the same name (EVO-1839).
+          if (result.triggerEvent.traits) {
+            for (const [key, value] of Object.entries(
+              result.triggerEvent.traits,
+            )) {
+              if (allVariables[`event_${key}`] === undefined) {
+                allVariables[`event_${key}`] = value;
+              }
             }
           }
         }
@@ -198,21 +217,72 @@ export class TriggerNode extends BaseNode {
       return current;
     }
 
+    // Handle custom-attribute mappings. The FE (CustomAttributeConfiguration)
+    // persists `attribute.*` sourcePaths, but `contact.custom_attribute.changed`
+    // is an identify DTO whose payload rides in `traits`
+    // (attributeName/attributeValue/oldValue) — resolve them explicitly so the
+    // VariableMapping actually populates (EVO-1839 AC2).
+    if (parts[0] === 'attribute') {
+      const traits = data.traits || {};
+      const properties = data.properties || {};
+      const key = parts.slice(1).join('.');
+
+      switch (key) {
+        case 'name':
+          return traits.attributeName ?? properties.attributeName;
+        case 'value':
+          return traits.attributeValue ?? properties.attributeValue;
+        case 'previous_value':
+          return traits.oldValue ?? properties.oldValue;
+        case 'timestamp':
+          return data.timestamp;
+      }
+
+      // Attribute-specific paths: `attribute.<name>` / `attribute.<name>_previous`
+      // (the FE emits the selected attribute key verbatim). Only resolve when the
+      // event is for that attribute.
+      const eventAttrName = traits.attributeName ?? properties.attributeName;
+      if (eventAttrName !== undefined) {
+        if (key === `${eventAttrName}_previous`) {
+          return traits.oldValue ?? properties.oldValue;
+        }
+        if (key === eventAttrName) {
+          return traits.attributeValue ?? properties.attributeValue;
+        }
+      }
+
+      return undefined;
+    }
+
     // Handle event paths directly
     if (parts[0] === 'event') {
       const eventPath = parts.slice(1);
 
-      for (const part of eventPath) {
-        if (current && typeof current === 'object' && part in current) {
-          current = current[part];
-        } else {
-          return undefined;
-        }
+      // identify-DTO payloads (custom attribute, label) ride in `traits`, but the
+      // FE persists `event.properties.<key>` paths — try properties, fall back to
+      // traits so those mappings populate (EVO-1839).
+      if (eventPath[0] === 'properties') {
+        const key = eventPath.slice(1);
+        const fromProps = this.walkPath(data.properties, key);
+        return fromProps !== undefined
+          ? fromProps
+          : this.walkPath(data.traits, key);
       }
-      return current;
+
+      // Generic event.* walk (also resolves `event.traits.<key>`).
+      return this.walkPath(current, eventPath);
     }
 
     // Default path resolution
+    return this.walkPath(current, parts);
+  }
+
+  /**
+   * Walk an object by a dot-path key array, returning undefined on any miss.
+   * Preserves the object guard so array/primitive traversal is unchanged.
+   */
+  private walkPath(obj: any, parts: string[]): any {
+    let current = obj;
     for (const part of parts) {
       if (current && typeof current === 'object' && part in current) {
         current = current[part];
@@ -220,7 +290,6 @@ export class TriggerNode extends BaseNode {
         return undefined;
       }
     }
-
     return current;
   }
 

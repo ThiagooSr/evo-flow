@@ -3,14 +3,16 @@ import {
   NotFoundException,
   BadRequestException,
 } from '@nestjs/common';
-import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { Journey } from './entities/journey.entity';
 import { CreateJourneyDto, UpdateJourneyDto } from './dto';
-import { ProcessingService } from '../processing/processing.service';
-import { EventData } from '../processing/interfaces/event-data.interface';
 import { CustomLoggerService } from '../../common/services/custom-logger.service';
 import { JourneyCacheService } from '../cache/services/journey-cache.service';
+import {
+  JourneySessionsService,
+  StartJourneyTriggerEvent,
+} from './services/journey-sessions.service';
+import { TenantDbContext } from '../../evo-extension-points';
 import { v4 as uuidv4 } from 'uuid';
 
 @Injectable()
@@ -18,12 +20,21 @@ export class JourneysService {
   private readonly logger: CustomLoggerService;
 
   constructor(
-    @InjectRepository(Journey)
-    private readonly journeyRepository: Repository<Journey>,
-    private readonly processingService: ProcessingService,
+    private readonly db: TenantDbContext,
     private readonly journeyCacheService: JourneyCacheService,
+    private readonly journeySessionsService: JourneySessionsService,
   ) {
     this.logger = new CustomLoggerService(JourneysService.name);
+  }
+
+  /**
+   * Tenant-scoped `journeys` repository (ADR14, story 10.1b). Resolved through
+   * the DB-context seam on every access so queries land on the connection
+   * carrying `app.current_tenant_id`; falls back to the global pool manager in
+   * community / single-tenant. Replaces the former `@InjectRepository(Journey)`.
+   */
+  private get journeyRepository(): Repository<Journey> {
+    return this.db.getRepository(Journey);
   }
 
   async create(createJourneyDto: CreateJourneyDto): Promise<Journey> {
@@ -55,6 +66,7 @@ export class JourneysService {
           isActive: cached.isActive,
           flowData: cached.flowData,
           flowTriggers: cached.flowTriggers,
+          variables: cached.variables,
           createdAt: cached.createdAt instanceof Date ? cached.createdAt : new Date(cached.createdAt),
           updatedAt: cached.updatedAt instanceof Date ? cached.updatedAt : new Date(cached.updatedAt),
         } as Journey));
@@ -82,6 +94,7 @@ export class JourneysService {
         isActive: cachedJourney.isActive,
         flowData: cachedJourney.flowData,
         flowTriggers: cachedJourney.flowTriggers,
+        variables: cachedJourney.variables,
         createdAt: cachedJourney.createdAt instanceof Date ? cachedJourney.createdAt : new Date(cachedJourney.createdAt),
         updatedAt: cachedJourney.updatedAt instanceof Date ? cachedJourney.updatedAt : new Date(cachedJourney.updatedAt),
       } as Journey;
@@ -166,16 +179,85 @@ export class JourneysService {
   async findActive(): Promise<Journey[]> {
     const cachedJourneys = await this.journeyCacheService.getActiveJourneys();
 
-    return cachedJourneys.map(cached => ({
-      id: cached.id,
-      name: cached.name,
-      description: cached.description,
-      isActive: cached.isActive,
-      flowData: cached.flowData,
-      flowTriggers: cached.flowTriggers,
-      createdAt: cached.createdAt instanceof Date ? cached.createdAt : new Date(cached.createdAt),
-      updatedAt: cached.updatedAt instanceof Date ? cached.updatedAt : new Date(cached.updatedAt),
-    } as Journey));
+    if (cachedJourneys.length > 0) {
+      return cachedJourneys.map(cached => ({
+        id: cached.id,
+        name: cached.name,
+        description: cached.description,
+        isActive: cached.isActive,
+        flowData: cached.flowData,
+        flowTriggers: cached.flowTriggers,
+        variables: cached.variables,
+        createdAt: cached.createdAt instanceof Date ? cached.createdAt : new Date(cached.createdAt),
+        updatedAt: cached.updatedAt instanceof Date ? cached.updatedAt : new Date(cached.updatedAt),
+      } as Journey));
+    }
+
+    // EVO-1927: read-through fallback. After an evo-flow restart the Redis
+    // active-journey index can be empty/stale and there is no implicit warm-up,
+    // so `getActiveJourneys()` returns []. The JourneyTriggerProcessor would
+    // then match every event against ZERO journeys and silently drop
+    // event-based triggers (Postgres has active journeys; cache reports none).
+    // On a cache miss, fall through to the DB as the source of truth and
+    // repopulate the cache so subsequent reads are served from Redis again.
+    const dbActiveJourneys = await this.journeyRepository.find({
+      where: { isActive: true },
+      order: { createdAt: 'DESC' },
+    });
+
+    if (dbActiveJourneys.length > 0) {
+      // Observability: cache returned 0 while the DB has active journeys —
+      // this is the regression signature, surface it.
+      this.logger.warn(
+        `findActive cache miss: active-journey cache returned 0 but DB has ${dbActiveJourneys.length} active journeys — serving from DB and repopulating cache (EVO-1927)`,
+      );
+
+      // Repopulate the cache (index + per-journey keys) so the next read is a
+      // cache hit. Best-effort: a cache write failure must not stop us returning
+      // the journeys we already have from the DB.
+      for (const journey of dbActiveJourneys) {
+        try {
+          await this.journeyCacheService.set(journey);
+        } catch (error) {
+          this.logger.warn(
+            `Failed to repopulate journey cache for ${journey.id}: ${error.message}`,
+          );
+        }
+      }
+    }
+
+    return dbActiveJourneys;
+  }
+
+  /**
+   * EVO-1927: warm the active-journey cache from Postgres. Called at boot by
+   * the JourneyTriggerProcessor BEFORE it starts consuming `journey-triggers`,
+   * so the very first event matches against the real set of active journeys
+   * instead of an empty (post-restart) Redis index. Best-effort and idempotent
+   * — `set()` upserts into the index — so a partial failure just degrades to
+   * the read-through fallback in `findActive`.
+   */
+  async warmActiveJourneysCache(): Promise<number> {
+    const dbActiveJourneys = await this.journeyRepository.find({
+      where: { isActive: true },
+      order: { createdAt: 'DESC' },
+    });
+
+    for (const journey of dbActiveJourneys) {
+      try {
+        await this.journeyCacheService.set(journey);
+      } catch (error) {
+        this.logger.warn(
+          `Failed to warm journey cache for ${journey.id}: ${error.message}`,
+        );
+      }
+    }
+
+    this.logger.log(
+      `Warmed active-journey cache with ${dbActiveJourneys.length} journeys from DB (EVO-1927)`,
+    );
+
+    return dbActiveJourneys.length;
   }
 
   async validateFlowData(journey: Journey): Promise<boolean> {
@@ -273,7 +355,6 @@ export class JourneysService {
   async processSpecificJourneyWebhookTrigger(
     journeyId: string,
     payload: any,
-    headers: any,
   ): Promise<{
     success: boolean;
     messageId: string;
@@ -305,41 +386,46 @@ export class JourneysService {
         throw new BadRequestException(`Journey ${journeyId} is not active`);
       }
 
-      const eventData: EventData = {
+      // The manual trigger targets THIS journey directly. It does not go
+      // through event matching — a `manual` trigger type matches no handler,
+      // so relying on `processEvent` would never start the named journey.
+      // Payload `data.*` is merged into the top level of `properties` so node
+      // inputs such as `conversation_id` are read the same way as events from
+      // the real CRM emitter (which publishes them at `properties` top level).
+      const triggerEvent: StartJourneyTriggerEvent = {
         messageId,
-        contactId,
         eventType: 'track',
         eventName: 'webhook.journey_trigger',
         properties: {
+          ...(payload.data || {}),
           journeyId,
           endpoint: `/api/v1/journeys/trigger/${journeyId}`,
           data: payload.data || {},
-          headers: this.sanitizeHeaders(headers),
           method: 'POST',
-          originalPayload: payload,
+          source: 'journey_webhook',
         },
         timestamp: processedAt.toISOString(),
-        context: {
-          source: 'journey_webhook',
-          userAgent: headers['user-agent'],
-          ip: headers['x-forwarded-for'] || headers['x-real-ip'],
-        },
       };
 
-      const result = await this.processingService.processEvent(eventData);
+      const result = await this.journeySessionsService.startJourney(
+        journey,
+        contactId,
+        triggerEvent,
+      );
 
-      if (result.status === 'error') {
+      if (!result.started) {
         throw new BadRequestException(
-          `Failed to process journey trigger event: ${result.error}`,
+          `Journey ${journeyId} not started: ${result.reason || 'unknown reason'}`,
         );
       }
 
-      this.logger.log('Journey webhook trigger event processed successfully', {
+      this.logger.log('Journey manual trigger started a session', {
         messageId,
         journeyId,
         contactId,
         journeyName: journey.name,
-        eventProcessingResult: result.status,
+        sessionId: result.sessionId,
+        workflowId: result.workflowId,
       });
 
       return {
@@ -398,9 +484,11 @@ export class JourneysService {
 
       journey.variables = variables;
 
-      await this.journeyRepository.save(journey);
+      const updatedJourney = await this.journeyRepository.save(journey);
 
-      return journey.variables || [];
+      await this.journeyCacheService.set(updatedJourney);
+
+      return updatedJourney.variables || [];
     } catch (error) {
       this.logger.error(
         `Error updating variables for journey ${id}: ${error.message}`,

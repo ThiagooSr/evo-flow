@@ -18,6 +18,7 @@ export class RedisQueueProcessor implements QueueProcessor {
       port: this.config.redis?.port || 6379,
       password: this.config.redis?.password,
       db: this.config.redis?.db || 0,
+      ...(this.config.redis?.tls ? { tls: this.config.redis.tls } : {}),
       maxRetriesPerRequest: 3,
       lazyConnect: true,
     });

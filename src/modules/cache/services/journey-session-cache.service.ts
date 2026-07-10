@@ -1,6 +1,6 @@
 import { Injectable } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository } from 'typeorm';
+import { In, Repository } from 'typeorm';
 import { EventEmitter2 } from '@nestjs/event-emitter';
 import { JourneySession } from '../../journeys/entities/journey-session.entity';
 import { BaseCacheService } from './base-cache.service';
@@ -47,6 +47,15 @@ export class JourneySessionCacheService extends BaseCacheService<
     repository: Repository<JourneySession>,
     eventEmitter: EventEmitter2,
   ) {
+    // EVO-1645: sessions ARE shared across instances. In BaseCacheService's
+    // (inverted vs. convention) naming, L1 = Redis (always on, shared) and
+    // L2 = per-instance in-memory LRU. `enableL2Cache: false` only disables
+    // the local memory layer — deliberately, because a per-instance LRU would
+    // serve stale session state when the journey worker runs >1 replica.
+    // Reads go Redis -> database, so a session can be seeded externally
+    // (E2E/QA) either by writing the Redis key
+    // `evo-campaign:journey-session:<id>` (+ the `:index` set) or by inserting
+    // a journey_sessions row — see src/modules/journeys/README.md.
     const cacheConfig: CacheConfig = {
       redisKeyPrefix: 'evo-campaign:journey-session',
       memoryMaxSize: 2000,
@@ -61,6 +70,102 @@ export class JourneySessionCacheService extends BaseCacheService<
       eventEmitter,
       cacheConfig,
       JourneySessionCacheService.name,
+    );
+  }
+
+  // EVO-1756: write-through to Postgres so session history is durable and
+  // survives a Redis flush/TTL. Every write path (create, status transitions,
+  // per-node updates) funnels through set(), so overriding it here makes the
+  // whole lifecycle durable. The read path already falls back to the DB on a
+  // cache miss (BaseCacheService.get/getAll), so no read change is needed.
+  // Redis is written first (hot path); the DB write follows and its failure
+  // propagates so the Temporal activity retries / create fails loudly rather
+  // than silently dropping the record.
+  async set(entity: JourneySession): Promise<void> {
+    await super.set(entity);
+    await this.persistToDatabase(entity);
+  }
+
+  private async persistToDatabase(value: JourneySession): Promise<void> {
+    const v = value as unknown as CachedJourneySession;
+    try {
+      // EVO-1929: `journey_sessions.contact_id` carries a FK to
+      // `evo_campaign.contacts` (FK_journey_sessions_contact_id, ON DELETE
+      // CASCADE), but the evo-flow community surface never populates that table
+      // — `ContactsService`/`ContactsClientService` are HTTP proxies to the CRM
+      // (Rails), so a contact that exists only in the CRM has no row here.
+      // EVO-1892 made the journey *start* path swallow the resulting FK
+      // violation (best-effort), but the per-node runtime writes from the
+      // Temporal activity still go through this durable (throwing) path, so the
+      // first per-node session persistence aborts the journey at node 1 for any
+      // contact not pre-seeded into evo_campaign.contacts.
+      //
+      // Fix (option b — lazy upsert): guarantee a minimal `contacts` row exists
+      // before saving the session. The contacts table requires only `id`; every
+      // other column has a DB default ('', false, '{}'::jsonb) or is nullable
+      // (see init-base-tables migration), so an id-only insert yields a valid
+      // row. `ON CONFLICT (id) DO NOTHING` keeps it idempotent and never
+      // clobbers a real CRM-synced contact. This resolves the root cause on ALL
+      // write paths while preserving referential integrity (vs. relaxing the
+      // FK).
+      await this.ensureContactRow(v.contactId);
+
+      await this.repository.save({
+        id: v.id,
+        journeyId: v.journeyId,
+        contactId: v.contactId,
+        status: v.status as JourneySession['status'],
+        currentNodeId: v.currentNodeId,
+        waitingFor: v.waitingFor,
+        variables: v.variables ?? {},
+        workflowId: v.workflowId,
+        workflowRunId: v.workflowRunId,
+        startedAt: v.startedAt,
+        completedAt: v.completedAt,
+        failedAt: v.failedAt,
+        errorMessage: v.errorMessage,
+        context: v.context,
+        retryCount: v.retryCount ?? 0,
+        maxRetries: v.maxRetries ?? 3,
+        executionLogs: v.executionLogs ?? [],
+      });
+    } catch (error) {
+      this.logger.error(
+        `Failed to persist journey session ${v.id} to Postgres: ${error.message}`,
+      );
+      throw error;
+    }
+  }
+
+  /**
+   * EVO-1929: idempotently ensure a minimal `contacts` row exists so the
+   * `journey_sessions.contact_id` FK is satisfied before persisting a session.
+   *
+   * The `contacts` table targeted here is evo-flow's OWN table in
+   * `evo_campaign` (created by the init-base-tables migration), NOT the CRM's
+   * Rails `contacts` — a Postgres FK never crosses databases. In that table
+   * only `id` is mandatory; every other column has a DB-level default
+   * ('', false, '{}'::jsonb) or is nullable, so an id-only insert is a valid,
+   * minimal row. `ON CONFLICT (id) DO NOTHING` makes this a no-op when the
+   * contact already exists (CRM-synced or seeded), so it never overwrites real
+   * contact data and is safe to call on every session write.
+   *
+   * Deploy caveat: this relies on evo-flow pointing at its own `evo_campaign`
+   * schema. If evo-flow is ever repointed at the CRM's Postgres (`evo_community`),
+   * the Rails `contacts` has `created_at`/`updated_at` NOT NULL WITHOUT a
+   * default, so the id-only insert would break — revisit this then.
+   *
+   * Only a missing/falsy id is skipped here; a present-but-non-uuid id is NOT
+   * skipped — it is passed straight to the INSERT and fails loudly there,
+   * preserving the existing error contract.
+   */
+  private async ensureContactRow(contactId?: string): Promise<void> {
+    if (!contactId) {
+      return;
+    }
+    await this.repository.manager.query(
+      'INSERT INTO contacts (id) VALUES ($1) ON CONFLICT (id) DO NOTHING',
+      [contactId],
     );
   }
 
@@ -81,7 +186,9 @@ export class JourneySessionCacheService extends BaseCacheService<
       const allSessions = await this.getAll();
       return allSessions.filter((session) => session.contactId === contactId);
     } catch (error) {
-      this.logger.error(`Failed to get sessions by contact ${contactId}: ${error.message}`);
+      this.logger.error(
+        `Failed to get sessions by contact ${contactId}: ${error.message}`,
+      );
       throw error;
     }
   }
@@ -93,6 +200,49 @@ export class JourneySessionCacheService extends BaseCacheService<
     return (
       allSessions.find((session) => session.workflowId === workflowId) || null
     );
+  }
+
+  /**
+   * Create-or-overwrite a session row in the terminal `failed` state when a
+   * journey could not be dispatched (EVO-1764). The normal failure path goes
+   * through a worker activity that has already created the row, so it can use
+   * `updateSessionStatus`; the dispatch guard runs when there is *no* worker, so
+   * the row does not exist yet and an update-only write would silently no-op.
+   * This goes through `set()` (Redis + Postgres write-through), making the
+   * failed-to-dispatch journey durable and visible instead of vanishing.
+   */
+  async createFailedDispatchSession(params: {
+    sessionId: string;
+    journeyId: string;
+    contactId: string;
+    workflowId?: string;
+    workflowRunId?: string;
+    errorMessage: string;
+  }): Promise<void> {
+    const now = new Date();
+    await this.set({
+      id: params.sessionId,
+      journeyId: params.journeyId,
+      contactId: params.contactId,
+      status: 'failed',
+      workflowId: params.workflowId,
+      workflowRunId: params.workflowRunId,
+      failedAt: now,
+      errorMessage: params.errorMessage,
+      variables: {},
+      retryCount: 0,
+      maxRetries: 3,
+      executionLogs: [],
+      createdAt: now,
+      updatedAt: now,
+      lastCached: now,
+    } as unknown as JourneySession);
+
+    this.eventEmitter.emit('journey-session.status-updated', {
+      id: params.sessionId,
+      status: 'failed',
+      errorMessage: params.errorMessage,
+    });
   }
 
   async updateSessionStatus(
@@ -168,13 +318,17 @@ export class JourneySessionCacheService extends BaseCacheService<
     });
   }
 
-  protected async getMultipleFromDatabase(ids: string[]): Promise<JourneySession[]> {
+  protected async getMultipleFromDatabase(
+    ids: string[],
+  ): Promise<JourneySession[]> {
     return this.repository.find({
-      where: { id: { $in: ids } as any },
+      where: { id: In(ids) },
     });
   }
 
-  protected async getAllFromDatabase(limit?: number): Promise<JourneySession[]> {
+  protected async getAllFromDatabase(
+    limit?: number,
+  ): Promise<JourneySession[]> {
     const query = this.repository
       .createQueryBuilder('session')
       .orderBy('session.updatedAt', 'DESC');
@@ -186,15 +340,71 @@ export class JourneySessionCacheService extends BaseCacheService<
     return query.getMany();
   }
 
+  // EVO-1896: idempotency guard keyed by (journey, contact, messageId).
+  //
+  // The EVO-1691 active/waiting-session guard only blocks *concurrent*
+  // re-entry into the same journey; once a session reaches a terminal state
+  // (completed/failed) it no longer blocks. Kafka delivers at-least-once, so a
+  // redelivery of the SAME trigger event after the first run has finished slips
+  // past that guard and starts a second session — running every side effect
+  // (messages, pipeline moves, …) twice. We dedup on the messageId, which is
+  // the producer-stable identity of a trigger event, so a replay of the exact
+  // same event is dropped while genuinely distinct events (different messageId)
+  // still start fresh runs.
+  //
+  // The check is a single atomic `SET key flag NX EX ttl`: NX makes the very
+  // first caller win even under concurrent redelivery across consumers/replicas
+  // (it's a CAS, not a read-then-write), and the TTL bounds the dedup window so
+  // the keyspace self-cleans. Returns true when THIS call claimed the messageId
+  // (i.e. it is the first to process it → proceed with startJourney), false
+  // when it was already claimed (→ skip, it's a replay).
+  private buildDedupKey(
+    journeyId: string,
+    contactId: string,
+    messageId: string,
+  ): string {
+    return `evo-campaign:journey:dedup:${journeyId}:${contactId}:${messageId}`;
+  }
+
+  /**
+   * Atomically claim a trigger (journey, contact, messageId) for execution.
+   * - Returns `true` if this is the first time we see the messageId for this
+   *   journey/contact → caller should proceed with startJourney.
+   * - Returns `false` if it was already claimed within the TTL window → caller
+   *   should skip (Kafka at-least-once replay / retry).
+   *
+   * Fail-open: if Redis is unavailable we return `true` so a transient cache
+   * outage never silently swallows legitimate triggers — at worst we lose the
+   * dedup protection for that window, which degrades back to today's behaviour
+   * rather than dropping the journey entirely.
+   */
+  async tryClaimTriggerMessage(
+    journeyId: string,
+    contactId: string,
+    messageId: string,
+    ttlSeconds: number = 24 * 60 * 60,
+  ): Promise<boolean> {
+    try {
+      await this.ensureRedisConnected();
+      const key = this.buildDedupKey(journeyId, contactId, messageId);
+      // ioredis: SET key value EX <ttl> NX → returns 'OK' if set, null if it
+      // already existed. Atomic compare-and-set, safe under concurrency.
+      const result = await this.redis.set(key, '1', 'EX', ttlSeconds, 'NX');
+      return result === 'OK';
+    } catch (error) {
+      this.logger.warn(
+        `Trigger dedup check failed for journey ${journeyId} contact ${contactId} message ${messageId}, allowing execution: ${error.message}`,
+      );
+      return true;
+    }
+  }
+
   // Waiting index helpers (Redis set per contact)
   private buildWaitingIndexKey(contactId: string): string {
     return `evo-campaign:journey-session:waiting:${contactId}`;
   }
 
-  async addToWaitingIndex(
-    sessionId: string,
-    contactId: string,
-  ): Promise<void> {
+  async addToWaitingIndex(sessionId: string, contactId: string): Promise<void> {
     if (!this.redis || this.redis.status !== 'ready') {
       await this.redis.connect();
     }

@@ -13,6 +13,8 @@ import type { ActionNodeActivities } from '../activities/action-nodes.activities
 import type { JourneyTrackingActivities } from '../activities/journey-tracking.activities';
 import type { JourneyTrackingContext } from '../services/journey-tracking.service';
 import type { WaitActivities } from '../activities/wait.activities';
+import { resolveInitialWorkflowStatus } from './initial-workflow-status.util';
+import { normalizeConditionalPathHandle } from './conditional-path-handle.util';
 
 // Interfaces for workflow input and state
 export interface JourneyExecutionInput {
@@ -24,6 +26,8 @@ export interface JourneyExecutionInput {
     eventName: string;
     eventType: string;
     properties: Record<string, any>;
+    // identify-DTO payload (custom attribute, label) rides in traits (EVO-1839).
+    traits?: Record<string, any>;
     timestamp: string;
   };
 }
@@ -141,10 +145,10 @@ export async function JourneyExecutionWorkflow(
           triggerEvent: input.triggerEvent, // Always use current trigger
         },
         completedNodes: existingSession.completedNodes || [],
-        status:
-          existingSession.status === 'completed'
-            ? 'running'
-            : existingSession.status || 'running', // Resume if not completed
+        // Session-store statuses ('active'/'waiting') are a different
+        // vocabulary from the workflow loop's ('running'/'paused') — copying
+        // them verbatim kept the loop from ever running (EVO-1690).
+        status: resolveInitialWorkflowStatus(existingSession.status),
       }
     : {
         currentNodeId: undefined,
@@ -247,6 +251,7 @@ export async function JourneyExecutionWorkflow(
         contactId: input.contactId,
         triggerEvent: input.triggerEvent,
         workflowId: info.workflowId,
+        workflowRunId: info.runId, // EVO-1859: persist run id via the authoritative create-path
       });
     } else {
       log.info(
@@ -274,6 +279,7 @@ export async function JourneyExecutionWorkflow(
           contactId: input.contactId,
           triggerEvent: input.triggerEvent,
           workflowId: info.workflowId,
+          workflowRunId: info.runId, // EVO-1859: persist run id via the authoritative create-path
         });
       }
     }
@@ -583,14 +589,40 @@ export async function JourneyExecutionWorkflow(
               }
               isWaiting = false;
 
-              // Determine next node based on wait result using activity
-              nextNodeId = await actionNodeActivities.processWaitCompletion({
-                nodeId: currentNode.id,
-                contactId: input.contactId,
-                sessionId: input.sessionId,
-                nodeData: currentNode.data,
-                waitResult: waitResult.result,
-              });
+              // Determine next node based on wait result.
+              //
+              // Primary routing is by outgoing-edge handle: the FE Wait node
+              // draws `wait-success` / `wait-otherwise` source handles for
+              // multi-output waits, so we resolve the handle and let the shared
+              // edge-matching logic below (sourceHandle === nextNodeHandle)
+              // pick the deterministic target — same contract as
+              // conditional/split nodes. (EVO-1912)
+              //
+              // Legacy id-based routing (successNodeId/otherwiseNodeId/
+              // nextNodeId in node-data) is preserved for journeys that
+              // explicitly persist those ids; the FE never writes them, so it
+              // returns undefined and we fall through to handle routing.
+              const [resolvedNextNodeId, resolvedHandle] = await Promise.all([
+                actionNodeActivities.processWaitCompletion({
+                  nodeId: currentNode.id,
+                  contactId: input.contactId,
+                  sessionId: input.sessionId,
+                  nodeData: currentNode.data,
+                  waitResult: waitResult.result,
+                }),
+                actionNodeActivities.resolveWaitHandle({
+                  nodeId: currentNode.id,
+                  contactId: input.contactId,
+                  sessionId: input.sessionId,
+                  nodeData: currentNode.data,
+                  waitResult: waitResult.result,
+                }),
+              ]);
+
+              // Persist on nodeResult so it survives the generic
+              // `nextNodeId = nodeResult.nextNodeId` reassignment below.
+              nodeResult.nextNodeId = resolvedNextNodeId;
+              nodeResult.nextNodeHandle = resolvedHandle;
 
               // Update variables with wait completion info
               nodeResult.variables = {
@@ -664,17 +696,22 @@ export async function JourneyExecutionWorkflow(
               labelId: currentNode.data.labelId,
               labelName: currentNode.data.labelName,
               sessionId: input.sessionId,
+              // EVO-1917: thread journeyId so interpolateNodeData resolves
+              // journey-default {{variables}} (mirrors send-webhook/scheduled-action).
+              journeyId: input.journeyId,
               nodeData: currentNode.data,
             });
             break;
 
           case 'removeLabel':
+          case 'remove-label-node': // Support both naming conventions
             nodeResult = await actionNodeActivities.executeRemoveLabelNode({
               nodeId: currentNode.id,
               contactId: input.contactId,
               labelId: currentNode.data.labelId,
               labelName: currentNode.data.labelName,
               sessionId: input.sessionId,
+              journeyId: input.journeyId, // EVO-1917
               nodeData: currentNode.data,
             });
             break;
@@ -685,6 +722,7 @@ export async function JourneyExecutionWorkflow(
               nodeId: currentNode.id,
               contactId: input.contactId,
               sessionId: input.sessionId,
+              journeyId: input.journeyId, // EVO-1917
               nodeData: currentNode.data,
             });
             break;
@@ -757,6 +795,10 @@ export async function JourneyExecutionWorkflow(
               nodeId: currentNode.id,
               contactId: input.contactId,
               sessionId: input.sessionId,
+              // EVO-1882: journeyId is required for interpolateNodeData to load
+              // journey-level variable defaults; without it those {{variables}}
+              // never resolve.
+              journeyId: input.journeyId,
               nodeData: currentNode.data,
             });
             break;
@@ -765,7 +807,10 @@ export async function JourneyExecutionWorkflow(
             nodeResult = await actionNodeActivities.executeConditionalNode({
               nodeId: currentNode.id,
               contactId: input.contactId,
+              conversationId:
+                input.triggerEvent?.properties?.conversation_id || undefined,
               sessionId: input.sessionId,
+              journeyId: input.journeyId, // EVO-1917: resolve journey-default {{var}} in condition values
               nodeData: currentNode.data,
             });
             break;
@@ -785,6 +830,7 @@ export async function JourneyExecutionWorkflow(
               conversationId: conversationId || undefined,
               sessionId: input.sessionId,
               contactId: input.contactId, // Pass contactId for creating new conversations
+              journeyId: input.journeyId, // EVO-1917: resolve journey-default {{var}} in message body
               nodeData: currentNode.data,
             });
 
@@ -797,12 +843,73 @@ export async function JourneyExecutionWorkflow(
             // });
             break;
 
+          case 'send-canned-response-node':
+            nodeResult =
+              await actionNodeActivities.executeSendCannedResponseNode({
+                nodeId: currentNode.id,
+                conversationId:
+                  input.triggerEvent?.properties?.conversation_id || undefined,
+                sessionId: input.sessionId,
+                contactId: input.contactId,
+                journeyId: input.journeyId, // EVO-1917
+                nodeData: currentNode.data,
+              });
+            break;
+
+          case 'send-email-team-node':
+            nodeResult = await actionNodeActivities.executeSendEmailTeamNode({
+              nodeId: currentNode.id,
+              conversationId:
+                input.triggerEvent?.properties?.conversation_id || undefined,
+              sessionId: input.sessionId,
+              journeyId: input.journeyId, // EVO-1917
+              nodeData: currentNode.data,
+            });
+            break;
+
+          case 'assign-to-pipeline-node':
+            nodeResult =
+              await actionNodeActivities.executeAssignToPipelineNode({
+                nodeId: currentNode.id,
+                conversationId:
+                  input.triggerEvent?.properties?.conversation_id || undefined,
+                sessionId: input.sessionId,
+                journeyId: input.journeyId, // EVO-1917
+                nodeData: currentNode.data,
+              });
+            break;
+
+          case 'move-to-pipeline-stage-node':
+            nodeResult =
+              await actionNodeActivities.executeMoveToPipelineStageNode({
+                nodeId: currentNode.id,
+                conversationId:
+                  input.triggerEvent?.properties?.conversation_id || undefined,
+                sessionId: input.sessionId,
+                journeyId: input.journeyId, // EVO-1917
+                nodeData: currentNode.data,
+              });
+            break;
+
+          case 'create-pipeline-task-node':
+            nodeResult =
+              await actionNodeActivities.executeCreatePipelineTaskNode({
+                nodeId: currentNode.id,
+                conversationId:
+                  input.triggerEvent?.properties?.conversation_id || undefined,
+                sessionId: input.sessionId,
+                journeyId: input.journeyId, // EVO-1917
+                nodeData: currentNode.data,
+              });
+            break;
+
           case 'send-transcript-node':
             nodeResult = await actionNodeActivities.executeSendTranscriptNode({
               nodeId: currentNode.id,
               conversationId:
                 input.triggerEvent?.properties?.conversation_id || '',
               sessionId: input.sessionId,
+              journeyId: input.journeyId, // EVO-1917
               nodeData: currentNode.data,
             });
             break;
@@ -813,6 +920,7 @@ export async function JourneyExecutionWorkflow(
               conversationId:
                 input.triggerEvent?.properties?.conversation_id || '',
               sessionId: input.sessionId,
+              journeyId: input.journeyId, // EVO-1917
               nodeData: currentNode.data,
             });
             break;
@@ -823,6 +931,7 @@ export async function JourneyExecutionWorkflow(
               conversationId:
                 input.triggerEvent?.properties?.conversation_id || '',
               sessionId: input.sessionId,
+              journeyId: input.journeyId, // EVO-1917
               nodeData: currentNode.data,
             });
             break;
@@ -834,6 +943,7 @@ export async function JourneyExecutionWorkflow(
                 input.triggerEvent?.properties?.conversation_id ||
                 'inbox-level', // Bot assignment can work without specific conversation
               sessionId: input.sessionId,
+              journeyId: input.journeyId, // EVO-1917
               nodeData: currentNode.data,
             });
             break;
@@ -861,7 +971,13 @@ export async function JourneyExecutionWorkflow(
               });
             break;
 
-          case 'snooze-conversation-node':
+          case 'defer-conversation-node':
+            // `defer-conversation-node` is the single canonical node type the FE
+            // journey editor emits for "snooze/defer". The legacy
+            // `snooze-conversation-node` case was removed (EVO-1920): no FE node,
+            // trigger, or saved-journey fixture ever produced that type, so it was
+            // unreachable. The underlying CRM effect is still "snoozed", which is
+            // why the executor keeps the name `executeSnoozeConversationNode`.
             nodeResult =
               await actionNodeActivities.executeSnoozeConversationNode({
                 nodeId: currentNode.id,
@@ -878,6 +994,7 @@ export async function JourneyExecutionWorkflow(
               conversationId:
                 input.triggerEvent?.properties?.conversation_id || '',
               sessionId: input.sessionId,
+              journeyId: input.journeyId, // EVO-1917
               nodeData: currentNode.data,
             });
             break;
@@ -1048,9 +1165,18 @@ export async function JourneyExecutionWorkflow(
           if (outgoingEdges && outgoingEdges.length > 0) {
             // Check if this is a multi-output node (like split or wait with fallback)
             if (nodeResult.nextNodeHandle) {
-              // Find edge matching the specific handle
+              // Find edge matching the specific handle. Normalize an optional
+              // legacy `path-` prefix on both sides so conditional journeys
+              // saved before EVO-1902 (sourceHandle `path-<id>`) still route to
+              // the matched branch instead of falling through to else/first.
+              // Split (`split-variant-<id>`) is untouched — see helper. (EVO-1922)
+              const normalizedHandle = normalizeConditionalPathHandle(
+                nodeResult.nextNodeHandle,
+              );
               const targetEdge = outgoingEdges.find(
-                (edge: any) => edge.sourceHandle === nodeResult.nextNodeHandle,
+                (edge: any) =>
+                  normalizeConditionalPathHandle(edge.sourceHandle) ===
+                  normalizedHandle,
               );
 
               // log.info('🔍 DEBUG: Handle-based edge matching', {

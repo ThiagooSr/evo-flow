@@ -3,6 +3,26 @@ import { JourneySessionStatus } from '../entities/journey-session.entity';
 import { CustomLoggerService } from '../../../common/services/custom-logger.service';
 import { JourneySessionCacheService, CachedJourneySession } from '../../cache/services/journey-session-cache.service';
 import { Client, Connection } from '@temporalio/client';
+import { randomUUID } from 'crypto';
+import { TEMPORAL_TASK_QUEUES } from '../../temporal/temporal-task-queues.constants';
+import { JourneyExecutionPollerService } from '../../temporal/services/journey-execution-poller.service';
+
+export interface StartJourneyTriggerEvent {
+  messageId: string;
+  eventName: string;
+  eventType: string;
+  properties: Record<string, any>;
+  timestamp: string;
+}
+
+export interface StartJourneyResult {
+  started: boolean;
+  sessionId?: string;
+  workflowId?: string;
+  reason?: string;
+}
+
+const DEFAULT_SESSION_MAX_RETRIES = 3;
 
 export interface SessionFilters {
   status?: string;
@@ -25,6 +45,8 @@ export class JourneySessionsService {
 
   constructor(
     private readonly sessionCacheService: JourneySessionCacheService,
+    // EVO-1764: same queue-health source of truth as the Kafka trigger guard.
+    private readonly queueHealthPoller: JourneyExecutionPollerService,
   ) {
     this.logger = new CustomLoggerService(JourneySessionsService.name);
   }
@@ -42,6 +64,138 @@ export class JourneySessionsService {
     }
 
     return this.temporalClient;
+  }
+
+  /**
+   * Create a journey session and start its Temporal workflow for a contact.
+   *
+   * The session is persisted to the cache BEFORE the workflow starts: the
+   * workflow's first `updateJourneySession` reads the session and throws if it
+   * is absent, and `updateSessionStatus` is a no-op when the session does not
+   * yet exist — so without this explicit create the workflow can never advance.
+   *
+   * Used by the manual trigger endpoint (`POST /journeys/trigger/:id`), which
+   * targets a specific journey directly rather than relying on event matching.
+   */
+  async startJourney(
+    journey: { id: string; name?: string },
+    contactId: string,
+    triggerEvent: StartJourneyTriggerEvent,
+    options: { enforceActiveSessionGuard?: boolean } = {},
+  ): Promise<StartJourneyResult> {
+    const { enforceActiveSessionGuard = true } = options;
+
+    if (enforceActiveSessionGuard) {
+      const contactSessions =
+        await this.sessionCacheService.getSessionsByContact(contactId);
+      // Scoped to THIS journey: a session in a different journey must not block
+      // this one. A dangling/active session therefore only blocks re-entry into
+      // the same journey, not every journey for the contact (EVO-1691).
+      const hasActiveOrWaiting = contactSessions.some(
+        (session) =>
+          session.journeyId === journey.id &&
+          ((session.status as JourneySessionStatus) ===
+            JourneySessionStatus.ACTIVE ||
+            (session.status as JourneySessionStatus) ===
+              JourneySessionStatus.WAITING),
+      );
+
+      if (hasActiveOrWaiting) {
+        this.logger.warn(
+          'Blocking journey start — contact already has an active/waiting session for this journey',
+          { contactId, journeyId: journey.id },
+        );
+        return { started: false, reason: 'contact_has_active_session' };
+      }
+    }
+
+    const sessionId = randomUUID();
+    const workflowId = `journey-${journey.id}-contact-${contactId}-${Date.now()}`;
+    const now = new Date();
+
+    await this.sessionCacheService.set({
+      id: sessionId,
+      journeyId: journey.id,
+      contactId,
+      status: JourneySessionStatus.ACTIVE,
+      variables: {},
+      retryCount: 0,
+      maxRetries: DEFAULT_SESSION_MAX_RETRIES,
+      executionLogs: [],
+      startedAt: now,
+      createdAt: now,
+      updatedAt: now,
+      lastCached: now,
+    } as any);
+
+    const { JourneyExecutionWorkflow } = await import(
+      '../../temporal/workflows/journey-execution.workflow'
+    );
+    const client = await this.getTemporalClient();
+
+    const handle = await client.workflow
+      .start(JourneyExecutionWorkflow, {
+        taskQueue: TEMPORAL_TASK_QUEUES.JOURNEY_EXECUTION,
+        workflowId,
+        args: [{ sessionId, journeyId: journey.id, contactId, triggerEvent }],
+        workflowExecutionTimeout: '30d',
+        workflowTaskTimeout: '1m',
+      })
+      .catch(async (error) => {
+        // Roll back the session created above: a failed start must not leave a
+        // phantom ACTIVE session that blocks future triggers for this contact.
+        await this.sessionCacheService.invalidate(sessionId);
+        throw error;
+      });
+
+    // EVO-1764 fail-fast guard for the manual path. `start()` succeeding only
+    // means the workflow was enqueued — if journey-execution has no executor it
+    // would sit unstarted until the 30d timeout while the pre-created ACTIVE row
+    // permanently blocks every future trigger for this contact+journey. A
+    // forced live check (this process may not run the background poller) fails
+    // it fast and visibly: terminate, flip the row to FAILED (so it no longer
+    // blocks), and return started:false so the caller surfaces the error.
+    const { unexecutable } = await this.queueHealthPoller.isQueueUnexecutable({
+      forceLive: true,
+    });
+    if (unexecutable) {
+      await handle
+        .terminate('no journey-execution worker available at dispatch (EVO-1764)')
+        .catch(() => undefined);
+      await this.sessionCacheService.updateSessionStatus(
+        sessionId,
+        JourneySessionStatus.FAILED,
+        {
+          workflowId,
+          workflowRunId: handle.firstExecutionRunId,
+          errorMessage:
+            'no journey-execution worker available — journey not dispatched',
+          failedAt: new Date(),
+        },
+      );
+      this.logger.warn(
+        'Journey not dispatched via manual trigger: no journey-execution worker',
+        { journeyId: journey.id, contactId, sessionId, workflowId },
+      );
+      return { started: false, sessionId, workflowId, reason: 'no_worker_available' };
+    }
+
+    await this.sessionCacheService.updateSessionStatus(
+      sessionId,
+      JourneySessionStatus.ACTIVE,
+      { workflowId, workflowRunId: handle.firstExecutionRunId },
+    );
+
+    this.logger.log('Journey workflow started via manual trigger', {
+      journeyId: journey.id,
+      journeyName: journey.name,
+      contactId,
+      sessionId,
+      workflowId,
+      runId: handle.firstExecutionRunId,
+    });
+
+    return { started: true, sessionId, workflowId };
   }
 
   /**

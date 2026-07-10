@@ -1,9 +1,9 @@
 import { Injectable } from '@nestjs/common';
 import { ClickHouseService } from '../../processing/clickhouse/clickhouse.service';
 import { SegmentQueueService } from './segment-queue.service';
-import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { Segment } from '../entities/segment.entity';
+import { TenantDbContext } from '../../../evo-extension-points';
 import { CustomLoggerService } from 'src/common/services/custom-logger.service';
 
 export interface SegmentInvalidationResult {
@@ -25,9 +25,12 @@ export class SegmentInvalidationService {
   constructor(
     private readonly clickhouseService: ClickHouseService,
     private readonly segmentQueueService: SegmentQueueService,
-    @InjectRepository(Segment)
-    private readonly segmentRepository: Repository<Segment>,
+    private readonly db: TenantDbContext,
   ) {}
+
+  private get segmentRepository(): Repository<Segment> {
+    return this.db.getRepository(Segment);
+  }
 
   /**
    * Check if a segment definition references a specific event
@@ -135,8 +138,17 @@ export class SegmentInvalidationService {
       }
     }
 
-    // For custom_attribute_changed events
-    if (eventName === 'custom_attribute_changed') {
+    // For custom-attribute change events (accept both event-name forms, EVO-1839).
+    // NOTE: this `nodeReferencesEvent` is only reached via `segmentReferencesEvent`
+    // → `findAffectedSegments`, and every public method of this service
+    // (findAffectedSegments / bulkInvalidateSegments / enqueueSegmentsForRecomputation)
+    // currently has NO callers — the LIVE invalidation runs in `segment-job.service.ts`
+    // and `atomic-processor.service.ts` (both fixed for EVO-1839). Kept in sync here
+    // for hygiene; do not rely on this path.
+    if (
+      eventName === 'contact.custom_attribute.changed' ||
+      eventName === 'custom_attribute_changed'
+    ) {
       if (node.type === 'CustomAttribute') {
         return true;
       }

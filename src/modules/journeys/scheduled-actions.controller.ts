@@ -19,17 +19,20 @@ import {
   ApiQuery,
 } from '@nestjs/swagger';
 import { Repository } from 'typeorm';
-import { InjectRepository } from '@nestjs/typeorm';
 import { ScheduledJourneyAction } from './entities/scheduled-journey-action.entity';
+import { TenantDbContext } from '../../evo-extension-points';
 
 @ApiTags('Scheduled Actions')
 @Controller('journeys')
 export class ScheduledActionsController {
   constructor(
-    @InjectRepository(ScheduledJourneyAction)
-    private readonly scheduledActionRepository: Repository<ScheduledJourneyAction>,
+    private readonly db: TenantDbContext,
     private readonly cls: ClsService,
   ) {}
+
+  private get scheduledActionRepository(): Repository<ScheduledJourneyAction> {
+    return this.db.getRepository(ScheduledJourneyAction);
+  }
 
   @Get(':journeyId/scheduled-actions')
   @ApiOperation({ summary: 'Get scheduled actions for a journey' })
