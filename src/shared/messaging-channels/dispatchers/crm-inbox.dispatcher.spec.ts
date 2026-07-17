@@ -5,6 +5,7 @@ import { ChannelDispatchInput } from '../interfaces/channel-dispatcher.interface
 type FetchCall = [string, RequestInit & { headers: Record<string, string> }];
 
 interface CrmBody {
+  source_id: string;
   inbox_id: string;
   contact_id: string;
   message: { content: string; template_params?: unknown };
@@ -16,6 +17,7 @@ describe('CrmInboxDispatcher', () => {
 
   const input: ChannelDispatchInput = {
     contactId: 'c1',
+    sourceId: '+5511999999999',
     inboxId: 'inb1',
     content: 'hello',
     campaignId: 'camp1',
@@ -61,6 +63,7 @@ describe('CrmInboxDispatcher', () => {
     expect(call[1].headers['X-Service-Token']).toBe('tok-123');
 
     const body = bodyOf(call);
+    expect(body.source_id).toBe('+5511999999999');
     expect(body.inbox_id).toBe('inb1');
     expect(body.contact_id).toBe('c1');
     expect(body.message.content).toBe('hello');
@@ -71,6 +74,24 @@ describe('CrmInboxDispatcher', () => {
     expect(result.messageId).toBe('msg1');
     expect(result.statusCode).toBe(200);
     expect(typeof result.latencyMs).toBe('number');
+  });
+
+  // Regression: source_id used to be a synthetic `campaign_<id>_<ts>` string
+  // instead of the contact's real WhatsApp identifier. The CRM validates
+  // source_id against a channel-specific regex (phone / @lid / @g.us /
+  // XX.token) and rejected every synthetic id with 422 "invalid source id
+  // for whatsapp inbox" — every campaign dispatch failed unconditionally.
+  it("forwards the caller's sourceId verbatim as source_id (not a synthetic id)", async () => {
+    fetchMock.mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: () => Promise.resolve({ id: 'c', messages: [] }),
+    });
+
+    await dispatcher.dispatch({ ...input, sourceId: '5511988887777@lid' });
+
+    const body = bodyOf(fetchMock.mock.calls[0] as FetchCall);
+    expect(body.source_id).toBe('5511988887777@lid');
   });
 
   it('returns success=false with error {code, message} on a non-ok response', async () => {

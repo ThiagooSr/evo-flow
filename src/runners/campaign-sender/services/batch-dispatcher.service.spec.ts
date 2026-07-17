@@ -142,6 +142,7 @@ describe('BatchDispatcherService', () => {
       expect(outcome).toEqual({ kind: 'sent', result: ok });
       expect(dispatch).toHaveBeenCalledWith({
         contactId: 'contact-1',
+        sourceId: '+5511999999999',
         inboxId: 'inbox-1',
         content: 'Hi Ana, your plan is pro',
         campaignId: 'camp-1',
@@ -153,6 +154,31 @@ describe('BatchDispatcherService', () => {
         },
         transportRetries: 1,
       });
+    });
+
+    // Regression: sourceId used to be a synthetic `campaign_<id>_<ts>`
+    // string baked into CrmInboxDispatcher itself, not the contact's real
+    // WhatsApp identifier — the CRM rejected every dispatch with 422
+    // "invalid source id for whatsapp inbox".
+    it('prefers contact.identifier over phoneNumber for sourceId (@lid/@g.us contacts)', async () => {
+      dispatch.mockResolvedValueOnce(ok);
+
+      await service.dispatch({
+        ...input(),
+        contact: { ...contact, identifier: '5511988887777@lid' },
+      });
+
+      const [[arg]] = dispatch.mock.calls as [[{ sourceId: string }]];
+      expect(arg.sourceId).toBe('5511988887777@lid');
+    });
+
+    it('falls back to phoneNumber when identifier is absent', async () => {
+      dispatch.mockResolvedValueOnce(ok);
+
+      await service.dispatch(input());
+
+      const [[arg]] = dispatch.mock.calls as [[{ sourceId: string }]];
+      expect(arg.sourceId).toBe('+5511999999999');
     });
 
     it('renders empty string for missing contact fields and attributes', async () => {

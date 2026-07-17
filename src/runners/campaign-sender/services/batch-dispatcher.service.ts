@@ -225,6 +225,11 @@ export class BatchDispatcherService {
     const { campaignId, inboxId, template, contact } = input;
     return this.crmInboxDispatcher.dispatch({
       contactId: contact.id,
+      // CRM validates source_id against a channel-specific regex (phone /
+      // @lid / @g.us / XX.token) — identifier already carries whichever of
+      // those the contact was actually resolved by; phoneNumber is the
+      // fallback for plain phone-identified contacts.
+      sourceId: contact.identifier || contact.phoneNumber || '',
       inboxId,
       content: this.renderContent(template.content, contact),
       campaignId,

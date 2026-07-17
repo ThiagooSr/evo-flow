@@ -54,7 +54,7 @@ export class CrmInboxDispatcher implements IChannelDispatcher {
     const url = `${this.baseURL}/api/v1/conversations`;
 
     const payload: CrmMessagePayload = {
-      source_id: `campaign_${input.campaignId}_${Date.now()}`,
+      source_id: input.sourceId,
       inbox_id: input.inboxId,
       contact_id: input.contactId,
       status: 'open',
