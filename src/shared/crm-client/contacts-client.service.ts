@@ -91,7 +91,7 @@ export class ContactsClientService {
 
     for (let page = 1; page <= maxPages; page++) {
       const payload = await this.crm.get<any>(
-        `/api/v1/contacts?page=${page}&pageSize=${pageSize}`,
+        `/api/v1/contacts?page=${page}&pageSize=${pageSize}&include_contact_inboxes=false`,
         opts,
       );
 

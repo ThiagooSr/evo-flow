@@ -159,6 +159,17 @@ describe('ContactsClientService', () => {
       const result = await service.listAllIds({ pageSize: 2 });
       expect(result).toEqual([{ id: 'a', blocked: false }]);
     });
+
+    it('requests include_contact_inboxes=false — the caller only reads id/blocked, and the CRM does the heaviest of its eager-loads (conversations -> pipeline_items) unconditionally, so skipping the contact_inboxes join is the one lever this client has to keep bulk pagination fast', async () => {
+      crm.get.mockResolvedValueOnce({ data: { payload: [] } });
+
+      await service.listAllIds({ pageSize: 500 });
+
+      expect(crm.get).toHaveBeenCalledWith(
+        '/api/v1/contacts?page=1&pageSize=500&include_contact_inboxes=false',
+        { pageSize: 500 },
+      );
+    });
   });
 
   describe('findByIds', () => {
