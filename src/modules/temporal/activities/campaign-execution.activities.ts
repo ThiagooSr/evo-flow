@@ -1,5 +1,6 @@
 import { log } from '@temporalio/activity';
 import type { INestApplicationContext } from '@nestjs/common';
+import { DataSource } from 'typeorm';
 import { getAppContext as getHeldContext } from '../../../shared/app-context.holder';
 import { AudienceComputationService } from '../../../shared/audience/audience-computation.service';
 import { CampaignsService } from '../../campaigns/services/campaigns.service';
@@ -223,7 +224,7 @@ export async function getCampaignBatch(
 
   try {
     const app = await getAppContext();
-    const dataSource = app.get('DataSource');
+    const dataSource = app.get(DataSource);
 
     // Query campaigns_contacts for specific batch
     const contacts = await dataSource
@@ -278,7 +279,7 @@ export async function updateCampaignStatus(
   try {
     const app = await getAppContext();
     const campaignsService = app.get(CampaignsService);
-    const dataSource = app.get('DataSource');
+    const dataSource = app.get(DataSource);
 
     // Get campaign repository
     const campaignRepo = dataSource.getRepository('Campaign');
@@ -360,7 +361,7 @@ export async function markBatchAsProcessed(
 
   try {
     const app = await getAppContext();
-    const dataSource = app.get('DataSource');
+    const dataSource = app.get(DataSource);
 
     // Update campaigns_contacts status for this batch
     await dataSource

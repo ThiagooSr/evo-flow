@@ -1,4 +1,8 @@
-import { publishCampaignsPack } from './campaign-execution.activities';
+import { DataSource } from 'typeorm';
+import {
+  publishCampaignsPack,
+  markBatchAsProcessed,
+} from './campaign-execution.activities';
 import { IMESSAGE_BROKER } from '../../../shared/broker/interfaces/message-broker.interface';
 import {
   CAMPAIGNS_PACK_TOPIC,
@@ -65,5 +69,39 @@ describe('publishCampaignsPack activity', () => {
         correlationId: CORRELATION_ID,
       }),
     ).rejects.toThrow('broker timeout');
+  });
+});
+
+describe('markBatchAsProcessed activity', () => {
+  // Regression: app.get('DataSource') (string token) never resolves for the
+  // default TypeORM connection — @nestjs/typeorm registers it under the
+  // DataSource class token. This crashed the campaign-worker process on every
+  // real execution attempt (Nest could not find DataSource element) since the
+  // bug was never exercised until Temporal was actually deployed.
+  const execute = jest.fn().mockResolvedValue(undefined);
+  const queryBuilder = {
+    update: jest.fn().mockReturnThis(),
+    set: jest.fn().mockReturnThis(),
+    where: jest.fn().mockReturnThis(),
+    andWhere: jest.fn().mockReturnThis(),
+    execute,
+  };
+  const getRepository = jest.fn().mockReturnValue({
+    createQueryBuilder: jest.fn().mockReturnValue(queryBuilder),
+  });
+
+  beforeEach(() => {
+    execute.mockClear();
+    getRepository.mockClear();
+    mockAppGet.mockReset().mockReturnValue({ getRepository });
+  });
+
+  it('resolves the DataSource via the class token, not the string token', async () => {
+    await markBatchAsProcessed(CAMPAIGN_ID, 1);
+
+    expect(mockAppGet).toHaveBeenCalledWith(DataSource);
+    expect(mockAppGet).not.toHaveBeenCalledWith('DataSource');
+    expect(getRepository).toHaveBeenCalledWith('CampaignContact');
+    expect(execute).toHaveBeenCalledTimes(1);
   });
 });
