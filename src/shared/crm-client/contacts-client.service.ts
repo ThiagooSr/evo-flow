@@ -89,10 +89,20 @@ export class ContactsClientService {
     const maxPages = opts?.maxPages ?? 1000; // safety bound: 500k contacts
     const out: Array<{ id: string; blocked: boolean }> = [];
 
+    // CrmClientService's generic default (5s) is tuned for latency-sensitive,
+    // user-facing calls. This one runs in a background worker paginating the
+    // full contacts table with OFFSET-based pagination (Kaminari `.page/.per`
+    // on the Rails side) — response time grows with page depth, and even
+    // after trimming the query (contact_inboxes skip + de-duplicated
+    // eager-load) deeper pages regularly exceed 5s. 20s buys real headroom
+    // without masking a genuine outage (still fails fast relative to a
+    // background job's tolerance).
+    const requestOpts = { ...opts, timeoutMs: opts?.timeoutMs ?? 20_000 };
+
     for (let page = 1; page <= maxPages; page++) {
       const payload = await this.crm.get<any>(
         `/api/v1/contacts?page=${page}&pageSize=${pageSize}&include_contact_inboxes=false`,
-        opts,
+        requestOpts,
       );
 
       // CRM Rails wraps in { data: [...] } or { data: { payload: [...] } }.

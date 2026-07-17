@@ -167,8 +167,26 @@ describe('ContactsClientService', () => {
 
       expect(crm.get).toHaveBeenCalledWith(
         '/api/v1/contacts?page=1&pageSize=500&include_contact_inboxes=false',
-        { pageSize: 500 },
+        { pageSize: 500, timeoutMs: 20_000 },
       );
+    });
+
+    it('defaults timeoutMs to 20s — CrmClientService generic 5s default is tuned for latency-sensitive calls, but this paginates the full table with Rails OFFSET pagination, which regularly exceeds 5s on deeper pages', async () => {
+      crm.get.mockResolvedValueOnce({ data: { payload: [] } });
+
+      await service.listAllIds({ pageSize: 500 });
+
+      const [, calledOpts] = crm.get.mock.calls[0];
+      expect(calledOpts).toMatchObject({ timeoutMs: 20_000 });
+    });
+
+    it('lets a caller-supplied timeoutMs win over the 20s default', async () => {
+      crm.get.mockResolvedValueOnce({ data: { payload: [] } });
+
+      await service.listAllIds({ pageSize: 500, timeoutMs: 45_000 });
+
+      const [, calledOpts] = crm.get.mock.calls[0];
+      expect(calledOpts).toMatchObject({ timeoutMs: 45_000 });
     });
   });
 
