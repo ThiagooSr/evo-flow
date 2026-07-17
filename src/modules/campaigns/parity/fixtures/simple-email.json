@@ -14,7 +14,7 @@
     "content": "Hi {contact.name}, reach us at {contact.email}.",
     "language": "en",
     "category": "newsletter",
-    "variables": [{ "key": "name" }]
+    "variables": [{ "name": "name" }]
   },
   "contactDto": {
     "id": "ct-se-1",

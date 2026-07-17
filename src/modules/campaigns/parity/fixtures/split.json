@@ -14,7 +14,7 @@
     "content": "{contact.name}, confirme em {contact.link}.",
     "language": "pt_BR",
     "category": "transactional",
-    "variables": [{ "key": "name" }, { "key": "link" }]
+    "variables": [{ "name": "name" }, { "name": "link" }]
   },
   "contactDto": {
     "id": "ct-split-1",
