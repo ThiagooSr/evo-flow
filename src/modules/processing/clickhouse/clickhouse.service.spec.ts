@@ -21,6 +21,8 @@ jest.mock('../config/processing.config', () => ({
 }));
 
 import { ClickHouseService } from './clickhouse.service';
+import { QueueMode } from '../enums';
+import { WriteMode } from '../enums/write-mode.enum';
 
 type ServiceInternals = {
   ensureKafkaEngineBroker(
@@ -30,9 +32,11 @@ type ServiceInternals = {
     dependentViews?: string[],
   ): Promise<boolean>;
   extractKafkaBrokers(createTableQuery: string): string | null;
+  shouldUseKafka(): boolean;
   query: jest.Mock;
   command: jest.Mock;
   logger: { log: jest.Mock; warn: jest.Mock; error: jest.Mock; debug: jest.Mock };
+  config: { queueMode?: QueueMode; writeMode?: WriteMode };
 };
 
 describe('ClickHouseService — journey-trigger broker guard (EVO-1893)', () => {
@@ -160,6 +164,29 @@ describe('ClickHouseService — journey-trigger broker guard (EVO-1893)', () => 
       expect(dropped).toBe(false);
       expect(internals.command).not.toHaveBeenCalled();
       expect(internals.logger.error).toHaveBeenCalled();
+    });
+  });
+
+  describe('shouldUseKafka', () => {
+    it('is false when neither queueMode nor writeMode is kafka (Kaiabi default: direct/ch-sync via RabbitMQ)', () => {
+      internals.config.queueMode = QueueMode.DIRECT;
+      internals.config.writeMode = WriteMode.CH_SYNC;
+
+      expect(internals.shouldUseKafka()).toBe(false);
+    });
+
+    it('is true when queueMode is kafka', () => {
+      internals.config.queueMode = QueueMode.KAFKA;
+      internals.config.writeMode = WriteMode.CH_SYNC;
+
+      expect(internals.shouldUseKafka()).toBe(true);
+    });
+
+    it('is true when writeMode is kafka', () => {
+      internals.config.queueMode = QueueMode.DIRECT;
+      internals.config.writeMode = WriteMode.KAFKA;
+
+      expect(internals.shouldUseKafka()).toBe(true);
     });
   });
 });
