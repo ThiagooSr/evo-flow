@@ -8,6 +8,8 @@ import {
 import { getProcessingConfig } from '../config/processing.config';
 import { v4 as uuidv4 } from 'uuid';
 import { CustomLoggerService } from 'src/common/services/custom-logger.service';
+import { QueueMode } from '../enums';
+import { WriteMode } from '../enums/write-mode.enum';
 
 export interface ClickHouseQueryBuilder {
   query: string;
@@ -42,6 +44,20 @@ export class ClickHouseService implements OnModuleInit, OnModuleDestroy {
       await this.client.close();
       this.logger.log('ClickHouse client closed');
     }
+  }
+
+  /**
+   * Mirrors KafkaService's own gate: when neither the queue nor the write
+   * path is configured for Kafka, ClickHouse must not create Kafka Engine
+   * tables/materialized views either. Left ungated, these attach as an
+   * insert trigger on contact_events and hang trying to reach a broker that
+   * was never deployed (frozen at the 'localhost:9092' config default).
+   */
+  private shouldUseKafka(): boolean {
+    return (
+      this.config.queueMode === QueueMode.KAFKA ||
+      this.config.writeMode === WriteMode.KAFKA
+    );
   }
 
   private async connect() {
@@ -124,13 +140,19 @@ export class ClickHouseService implements OnModuleInit, OnModuleDestroy {
       }
 
       // 4. Criar integração Kafka (DEPOIS da tabela, pois a MV depende dela)
-      try {
-        await this.createKafkaIntegration(databaseName, 'contact_events');
-        this.logger.log(`✅ Kafka integration creation completed`);
-      } catch (error) {
-        this.logger.error(`❌ Failed to create Kafka integration: ${error.message}`, error.stack);
-        // Don't throw - Kafka integration is optional for ClickHouse Cloud
-        this.logger.warn('⚠️ Continuing without Kafka integration (ClickHouse Cloud may not support Kafka Engine)');
+      if (this.shouldUseKafka()) {
+        try {
+          await this.createKafkaIntegration(databaseName, 'contact_events');
+          this.logger.log(`✅ Kafka integration creation completed`);
+        } catch (error) {
+          this.logger.error(`❌ Failed to create Kafka integration: ${error.message}`, error.stack);
+          // Don't throw - Kafka integration is optional for ClickHouse Cloud
+          this.logger.warn('⚠️ Continuing without Kafka integration (ClickHouse Cloud may not support Kafka Engine)');
+        }
+      } else {
+        this.logger.log(
+          'ℹ️ Kafka integration for ClickHouse skipped: neither QUEUE_MODE nor WRITE_MODE is set to kafka',
+        );
       }
 
       // 5. Criar tabelas para segment computation
@@ -143,13 +165,19 @@ export class ClickHouseService implements OnModuleInit, OnModuleDestroy {
       }
 
       // 6. Criar fila de triggers para journeys
-      try {
-        await this.createJourneyTriggerQueue(databaseName);
-        this.logger.log(`✅ Journey trigger queue creation completed`);
-      } catch (error) {
-        this.logger.error(`❌ Failed to create journey trigger queue: ${error.message}`, error.stack);
-        // Don't throw - journey triggers are optional
-        this.logger.warn('⚠️ Continuing without journey trigger queue');
+      if (this.shouldUseKafka()) {
+        try {
+          await this.createJourneyTriggerQueue(databaseName);
+          this.logger.log(`✅ Journey trigger queue creation completed`);
+        } catch (error) {
+          this.logger.error(`❌ Failed to create journey trigger queue: ${error.message}`, error.stack);
+          // Don't throw - journey triggers are optional
+          this.logger.warn('⚠️ Continuing without journey trigger queue');
+        }
+      } else {
+        this.logger.log(
+          'ℹ️ Journey trigger queue skipped: neither QUEUE_MODE nor WRITE_MODE is set to kafka',
+        );
       }
 
       // 7. Listar todas as tabelas criadas
