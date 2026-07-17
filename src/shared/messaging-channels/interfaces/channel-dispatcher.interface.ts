@@ -6,6 +6,14 @@
  */
 export interface ChannelDispatchInput {
   contactId: string;
+  /**
+   * The recipient's channel identifier (WhatsApp phone number / `@lid` /
+   * `@g.us` group id — see CRM's Contact#identifier). Required by
+   * POST /api/v1/conversations' `source_id`, which the CRM validates against
+   * a channel-specific regex; omitting it (or sending a synthetic id) fails
+   * every dispatch with 422 "invalid source id for whatsapp inbox".
+   */
+  sourceId: string;
   inboxId: string;
   content: string;
   campaignId: string;
