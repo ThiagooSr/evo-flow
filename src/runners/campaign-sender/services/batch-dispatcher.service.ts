@@ -1,9 +1,8 @@
 import { Injectable } from '@nestjs/common';
-import { Repository } from 'typeorm';
 import { Counter, register } from 'prom-client';
 import { MessageTemplate } from '../../../shared/entities/message-template.entity';
-import { TenantDbContext } from '../../../evo-extension-points';
 import { CustomLoggerService } from '../../../common/services/custom-logger.service';
+import { CrmClientService } from '../../../shared/crm-client/crm-client.service';
 import { CrmInboxDispatcher } from '../../../shared/messaging-channels/dispatchers/crm-inbox.dispatcher';
 import type { DispatchResult } from '../../../shared/messaging-channels/interfaces/channel-dispatcher.interface';
 import type { HydratedContact } from '../../../shared/crm-client/types/contact';
@@ -88,7 +87,7 @@ export class BatchDispatcherService {
   private readonly terminalFailuresTotal: Counter<string>;
 
   constructor(
-    private readonly db: TenantDbContext,
+    private readonly crm: CrmClientService,
     private readonly crmInboxDispatcher: CrmInboxDispatcher,
     private readonly rateLimiter: RateLimiterService,
     private readonly logger: CustomLoggerService,
@@ -114,29 +113,33 @@ export class BatchDispatcherService {
       });
   }
 
-  private get messageTemplateRepository(): Repository<MessageTemplate> {
-    return this.db.getRepository(MessageTemplate);
-  }
-
   /**
    * Load the batch's template once. A missing template is terminal: every
    * contact in the batch would fail identically, so the whole message is
    * dropped to the DLQ instead of burning one FAILED row per contact.
+   *
+   * Message templates are owned by evo-ai-crm-community (Meta/WhatsApp
+   * template approval lives there) — evo-flow's local `message_templates`
+   * table has no migration and nothing populates it, the same
+   * abandoned-local-mirror pattern as labels/tags (see
+   * SegmentQueryBuilderService#getContactsByTags). Fetched once per batch,
+   * not per contact.
    */
   async loadTemplate(
     campaignId: string,
     templateId: string,
   ): Promise<MessageTemplate> {
-    const template = await this.messageTemplateRepository.findOne({
-      where: { id: templateId },
-    });
+    const payload = await this.crm.get<any>(
+      `/api/v1/message_templates/${templateId}`,
+    );
+    const template = payload?.data ?? payload;
     if (!template) {
       throw new CampaignNotConfiguredError(
         campaignId,
         `message template ${templateId} not found`,
       );
     }
-    return template;
+    return template as MessageTemplate;
   }
 
   async dispatch(input: BatchDispatchInput): Promise<BatchDispatchOutcome> {
