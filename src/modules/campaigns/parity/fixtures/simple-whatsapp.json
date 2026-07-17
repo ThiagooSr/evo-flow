@@ -14,7 +14,7 @@
     "content": "Olá {contact.name}! Seu código é {contact.code}.",
     "language": "pt_BR",
     "category": "marketing",
-    "variables": [{ "key": "name" }, { "key": "code" }]
+    "variables": [{ "name": "name" }, { "name": "code" }]
   },
   "contactDto": {
     "id": "ct-sw-1",

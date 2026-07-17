@@ -20,7 +20,9 @@ const template = {
   content: 'Hi {contact.name}, your plan is {{contact.plan}}',
   language: 'pt_BR',
   category: 'marketing',
-  variables: [{ key: 'plan' }],
+  // CRM's MessageTemplate#variables entries key by `name` (see
+  // render_with_variables in message_template.rb) — not `key`.
+  variables: [{ name: 'plan' }],
 } as unknown as MessageTemplate;
 
 const contact: HydratedContact = {
@@ -150,7 +152,7 @@ describe('BatchDispatcherService', () => {
           name: 'welcome',
           category: 'marketing',
           language: 'pt_BR',
-          processed_params: [{ key: 'plan' }],
+          processed_params: { plan: 'pro' },
         },
         transportRetries: 1,
       });
@@ -179,6 +181,64 @@ describe('BatchDispatcherService', () => {
 
       const [[arg]] = dispatch.mock.calls as [[{ sourceId: string }]];
       expect(arg.sourceId).toBe('+5511999999999');
+    });
+
+    // Regression: processed_params used to forward template.variables
+    // (an array of { name, required, ... } definitions, not resolved
+    // values) verbatim, cast to Record<string, unknown> — sent an Array
+    // over the wire. CRM validates processed_params as `type: object` and
+    // rejected every dispatch with 422 "Template params/processed params
+    // must be of type hash".
+    it('builds processed_params as a {name: value} hash, resolving each variable from the contact', async () => {
+      dispatch.mockResolvedValueOnce(ok);
+
+      await service.dispatch({
+        ...input(),
+        template: {
+          ...template,
+          variables: [{ name: 'name' }, { name: 'plan' }],
+        } as unknown as MessageTemplate,
+      });
+
+      const [[arg]] = dispatch.mock.calls as [
+        [{ templateParams: { processed_params: Record<string, string> } }],
+      ];
+      expect(arg.templateParams.processed_params).toEqual({
+        name: 'Ana',
+        plan: 'pro',
+      });
+    });
+
+    it('resolves an unmatched variable name to an empty string rather than omitting it', async () => {
+      dispatch.mockResolvedValueOnce(ok);
+
+      await service.dispatch({
+        ...input(),
+        template: {
+          ...template,
+          variables: [{ name: 'nonexistent' }],
+        } as unknown as MessageTemplate,
+      });
+
+      const [[arg]] = dispatch.mock.calls as [
+        [{ templateParams: { processed_params: Record<string, string> } }],
+      ];
+      expect(arg.templateParams.processed_params).toEqual({ nonexistent: '' });
+    });
+
+    it('sends an empty hash (not an array) when the template has no variables', async () => {
+      dispatch.mockResolvedValueOnce(ok);
+
+      await service.dispatch({
+        ...input(),
+        template: { ...template, variables: [] } as unknown as MessageTemplate,
+      });
+
+      const [[arg]] = dispatch.mock.calls as [
+        [{ templateParams: { processed_params: unknown } }],
+      ];
+      expect(arg.templateParams.processed_params).toEqual({});
+      expect(Array.isArray(arg.templateParams.processed_params)).toBe(false);
     });
 
     it('renders empty string for missing contact fields and attributes', async () => {

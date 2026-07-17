@@ -17,7 +17,7 @@
     "content": "Oferta A para {contact.name}.",
     "language": "pt_BR",
     "category": "marketing",
-    "variables": [{ "key": "name" }]
+    "variables": [{ "name": "name" }]
   },
   "contactDto": {
     "id": "ct-ab-1",

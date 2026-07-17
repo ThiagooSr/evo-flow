@@ -237,12 +237,7 @@ export class BatchDispatcherService {
         name: template.name,
         category: template.category || undefined,
         language: template.language || 'pt_BR',
-        // Entity types `variables` as jsonb array; the legacy sender forwards
-        // it verbatim as processed_params, so preserve the wire shape.
-        processed_params: (template.variables ?? {}) as unknown as Record<
-          string,
-          unknown
-        >,
+        processed_params: this.buildProcessedParams(template, contact),
       },
       transportRetries: 1,
     });
@@ -335,18 +330,11 @@ export class BatchDispatcherService {
   }
 
   private renderContent(content: string, contact: HydratedContact): string {
-    const values: Record<string, string> = {
-      'contact.name': contact.name || '',
-      'contact.email': contact.email || '',
-      'contact.phone': contact.phoneNumber || '',
-    };
-    for (const [key, value] of Object.entries(contact.customAttributes ?? {})) {
-      values[`contact.${key}`] =
-        value === null || value === undefined
-          ? ''
-          : typeof value === 'object'
-            ? JSON.stringify(value)
-            : String(value);
+    const values: Record<string, string> = {};
+    for (const [key, value] of Object.entries(
+      this.contactFieldValues(contact),
+    )) {
+      values[`contact.${key}`] = value;
     }
 
     let rendered = content;
@@ -357,5 +345,49 @@ export class BatchDispatcherService {
       rendered = rendered.replaceAll(`{${key}}`, value);
     }
     return rendered;
+  }
+
+  /** `name` / `email` / `phone` plus every custom attribute, all as strings. */
+  private contactFieldValues(
+    contact: HydratedContact,
+  ): Record<string, string> {
+    const values: Record<string, string> = {
+      name: contact.name || '',
+      email: contact.email || '',
+      phone: contact.phoneNumber || '',
+    };
+    for (const [key, value] of Object.entries(contact.customAttributes ?? {})) {
+      values[key] =
+        value === null || value === undefined
+          ? ''
+          : typeof value === 'object'
+            ? JSON.stringify(value)
+            : String(value);
+    }
+    return values;
+  }
+
+  /**
+   * Builds the `{ [variableName]: value }` hash the CRM's
+   * MessageTemplate#render_with_variables expects for `processed_params`
+   * (validated server-side as `type: object` — see message.rb). The entity
+   * types `variables` as a jsonb array of `{ name, required, ... }`
+   * definitions, not resolved values; sending it through unchanged (or as
+   * `{}` cast from an array) fails CRM validation with "Template
+   * params/processed params must be of type hash" on every dispatch.
+   */
+  private buildProcessedParams(
+    template: MessageTemplate,
+    contact: HydratedContact,
+  ): Record<string, string> {
+    const fieldValues = this.contactFieldValues(contact);
+    const params: Record<string, string> = {};
+    for (const variable of (template.variables ??
+      []) as Array<{ name?: string }>) {
+      if (variable?.name) {
+        params[variable.name] = fieldValues[variable.name] ?? '';
+      }
+    }
+    return params;
   }
 }
