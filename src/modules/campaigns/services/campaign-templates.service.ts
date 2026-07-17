@@ -7,12 +7,15 @@ import { Repository } from 'typeorm';
 import { CampaignTemplate } from '../entities/campaign-template.entity';
 import { Campaign } from '../entities/campaign.entity';
 import { CreateCampaignTemplateDto } from '../dto';
-import { MessageTemplate } from '../../../shared/entities/message-template.entity';
 import { TenantDbContext } from '../../../evo-extension-points';
+import { CrmClientService } from '../../../shared/crm-client/crm-client.service';
 
 @Injectable()
 export class CampaignTemplatesService {
-  constructor(private readonly db: TenantDbContext) {}
+  constructor(
+    private readonly db: TenantDbContext,
+    private readonly crm: CrmClientService,
+  ) {}
 
   private get campaignTemplateRepository(): Repository<CampaignTemplate> {
     return this.db.getRepository(CampaignTemplate);
@@ -20,10 +23,6 @@ export class CampaignTemplatesService {
 
   private get campaignRepository(): Repository<Campaign> {
     return this.db.getRepository(Campaign);
-  }
-
-  private get messageTemplateRepository(): Repository<MessageTemplate> {
-    return this.db.getRepository(MessageTemplate);
   }
 
   async create(
@@ -39,12 +38,17 @@ export class CampaignTemplatesService {
       throw new NotFoundException(`Campaign with ID "${campaignId}" not found`);
     }
 
-    // Verify message template exists
-    const messageTemplate = await this.messageTemplateRepository.findOne({
-      where: { id: createTemplateDto.messageTemplateId, active: true },
-    });
+    // Verify message template exists and is active. Message templates are
+    // owned by evo-ai-crm-community (Meta/WhatsApp template approval lives
+    // there) — evo-flow's local `message_templates` table has no migration
+    // and nothing populates it, the same abandoned-local-mirror pattern as
+    // labels/tags (see SegmentQueryBuilderService#getContactsByTags).
+    const payload = await this.crm.get<any>(
+      `/api/v1/message_templates/${createTemplateDto.messageTemplateId}`,
+    );
+    const messageTemplate = payload?.data ?? payload;
 
-    if (!messageTemplate) {
+    if (!messageTemplate || messageTemplate.active !== true) {
       throw new NotFoundException(
         `Message template with ID "${createTemplateDto.messageTemplateId}" not found or inactive`,
       );

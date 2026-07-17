@@ -53,7 +53,7 @@ const metricValues = async (name: string) => {
 
 describe('BatchDispatcherService', () => {
   let service: BatchDispatcherService;
-  let findOne: jest.Mock;
+  let crmGet: jest.Mock;
   let dispatch: jest.Mock;
   let acquire: jest.Mock;
   let log: jest.Mock;
@@ -81,14 +81,13 @@ describe('BatchDispatcherService', () => {
     register.removeSingleMetric(RETRIES_METRIC);
     register.removeSingleMetric(TERMINAL_METRIC);
 
-    findOne = jest.fn();
+    crmGet = jest.fn();
     dispatch = jest.fn();
     acquire = jest.fn().mockResolvedValue(true);
     log = jest.fn();
     warn = jest.fn();
-    const db = { getRepository: () => ({ findOne }) };
     service = new BatchDispatcherService(
-      db as any,
+      { get: crmGet } as any,
       { dispatch } as any,
       { acquire } as any,
       { log, warn } as any,
@@ -103,17 +102,30 @@ describe('BatchDispatcherService', () => {
   });
 
   describe('loadTemplate', () => {
-    it('returns the template when it exists', async () => {
-      findOne.mockResolvedValueOnce(template);
+    // Regression: this used to read evo-flow's local `message_templates`
+    // table, which has no migration and nothing populates it (message
+    // templates are owned by evo-ai-crm-community — Meta/WhatsApp approval
+    // lives there). Every campaign send failed with "relation
+    // message_templates does not exist". Now fetched from CRM once per batch.
+    it('fetches the template from CRM and returns it', async () => {
+      crmGet.mockResolvedValueOnce({ data: template });
 
-      await expect(service.loadTemplate('camp-1', 'tpl-1')).resolves.toBe(
+      await expect(service.loadTemplate('camp-1', 'tpl-1')).resolves.toEqual(
         template,
       );
-      expect(findOne).toHaveBeenCalledWith({ where: { id: 'tpl-1' } });
+      expect(crmGet).toHaveBeenCalledWith('/api/v1/message_templates/tpl-1');
     });
 
-    it('throws a terminal CampaignNotConfiguredError when missing', async () => {
-      findOne.mockResolvedValueOnce(null);
+    it('accepts an unwrapped (non-{data}) CRM response', async () => {
+      crmGet.mockResolvedValueOnce(template);
+
+      await expect(service.loadTemplate('camp-1', 'tpl-1')).resolves.toEqual(
+        template,
+      );
+    });
+
+    it('throws a terminal CampaignNotConfiguredError when missing (404 -> null)', async () => {
+      crmGet.mockResolvedValueOnce(null);
 
       await expect(service.loadTemplate('camp-1', 'tpl-x')).rejects.toThrow(
         CampaignNotConfiguredError,
