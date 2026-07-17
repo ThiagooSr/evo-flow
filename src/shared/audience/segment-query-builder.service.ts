@@ -2,7 +2,6 @@ import { Injectable } from '@nestjs/common';
 import { Repository } from 'typeorm';
 import { Campaign } from '../../modules/campaigns/entities/campaign.entity';
 import { Segment } from '../../modules/segments/entities/segment.entity';
-import { Tagging, TaggableType } from '../../modules/labels/entities/tagging.entity';
 import { TenantDbContext } from '../../evo-extension-points';
 import { ContactsClientService } from '../crm-client/contacts-client.service';
 import type { HydratedContact } from '../crm-client/types/contact';
@@ -48,9 +47,6 @@ export class SegmentQueryBuilderService {
     return this.db.getRepository(Segment);
   }
 
-  private get taggingRepository(): Repository<Tagging> {
-    return this.db.getRepository(Tagging);
-  }
 
   /**
    * Analyze campaign definition and determine the best query strategy
@@ -159,30 +155,26 @@ export class SegmentQueryBuilderService {
   }
 
   /**
-   * Get contacts by tags/labels using the local taggings table. The
-   * `taggings` table is owned by evo-flow (labels module), not CRM, so this
-   * query stays local. Only Contact-type taggings are returned. Blocked-flag
-   * filtering is deferred to the hydration step (consumers).
+   * Get contacts by tags/labels via the CRM list endpoint, filtered by
+   * `labels[]=`. CRM (evo-ai-crm-community, acts_as_taggable_on) is the sole
+   * owner of label/tag data — TaggingService is explicitly deprecated
+   * ("evo-flow no longer persists tagging state locally"), and evo-flow's
+   * local `tags`/`taggings` tables are unmaintained (nothing writes to them
+   * — the identify-event pipeline only feeds ClickHouse). Matching by name
+   * mirrors `getContactsByTags`'s CRM counterpart: `tagged_with(labels, any:
+   * true)` in contacts_controller.rb's `listable_contacts`.
    */
   private async getContactsByTags(
     tags: string[],
     limit?: number,
     offset: number = 0,
   ): Promise<AudienceQueryResult> {
-    const baseQb = this.taggingRepository
-      .createQueryBuilder('tagging')
-      .innerJoin('tagging.tag', 'tag')
-      .where('tagging.taggableType = :type', { type: TaggableType.CONTACT })
-      .andWhere('tag.name IN (:...tags)', { tags })
-      .select('DISTINCT tagging.taggableId', 'id');
+    const all = await this.contactsClient.listAllIds({ labels: tags });
+    const active = all.filter((c) => !c.blocked).map((c) => c.id);
 
-    // getRawMany() doesn't honour skip/take cleanly with DISTINCT, so do it in JS.
-    const rows = await baseQb.getRawMany();
-    const allIds = rows.map((r) => r.id);
-    const total = allIds.length;
-
+    const total = active.length;
     const paginated =
-      limit !== undefined ? allIds.slice(offset, offset + limit) : allIds;
+      limit !== undefined ? active.slice(offset, offset + limit) : active;
 
     return {
       contactIds: paginated,

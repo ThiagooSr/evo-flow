@@ -83,7 +83,19 @@ export class ContactsClientService {
    * a page returns fewer than pageSize records OR an empty page.
    */
   async listAllIds(
-    opts?: RequestOptions & { pageSize?: number; maxPages?: number },
+    opts?: RequestOptions & {
+      pageSize?: number;
+      maxPages?: number;
+      /**
+       * Filter to contacts carrying ANY of these label names (CRM
+       * `tagged_with(labels, any: true)` — see contacts_controller.rb
+       * `listable_contacts`). Matches by name: CRM is the sole owner of
+       * label data (see TaggingService's deprecation note — evo-flow does
+       * NOT mirror tagging state locally), so there is no local id to
+       * filter by.
+       */
+      labels?: string[];
+    },
   ): Promise<Array<{ id: string; blocked: boolean }>> {
     const pageSize = opts?.pageSize ?? 500;
     const maxPages = opts?.maxPages ?? 1000; // safety bound: 500k contacts
@@ -98,10 +110,13 @@ export class ContactsClientService {
     // without masking a genuine outage (still fails fast relative to a
     // background job's tolerance).
     const requestOpts = { ...opts, timeoutMs: opts?.timeoutMs ?? 20_000 };
+    const labelsQuery = (opts?.labels ?? [])
+      .map((name) => `&labels[]=${encodeURIComponent(name)}`)
+      .join('');
 
     for (let page = 1; page <= maxPages; page++) {
       const payload = await this.crm.get<any>(
-        `/api/v1/contacts?page=${page}&pageSize=${pageSize}&include_contact_inboxes=false`,
+        `/api/v1/contacts?page=${page}&pageSize=${pageSize}&include_contact_inboxes=false${labelsQuery}`,
         requestOpts,
       );
 
