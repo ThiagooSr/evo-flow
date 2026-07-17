@@ -58,4 +58,63 @@ describe('SegmentQueryBuilderService', () => {
       segmentId: 'seg-nested-42',
     });
   });
+
+  describe('executeAudienceQuery — tags strategy', () => {
+    // Regression: getContactsByTags used to query evo-flow's local
+    // `taggings`/`tags` tables directly via TypeORM. That table is
+    // unmaintained (TaggingService is explicitly deprecated — "evo-flow no
+    // longer persists tagging state locally"; nothing in the identify-event
+    // pipeline writes there, only ClickHouse does), so every tag-targeted
+    // campaign silently resolved to zero contacts no matter how the
+    // audience was configured. CRM is the source of truth for labels and
+    // already supports filtering contacts by label name.
+    it('resolves tag names via CRM (ContactsClientService.listAllIds), not the local taggings table', async () => {
+      contactsClient.listAllIds = jest.fn().mockResolvedValue([
+        { id: 'c1', blocked: false },
+        { id: 'c2', blocked: false },
+      ]);
+
+      const result = await service.executeAudienceQuery(
+        {} as any,
+        { type: 'tags', tags: ['suporte'] },
+      );
+
+      expect(contactsClient.listAllIds).toHaveBeenCalledWith({ labels: ['suporte'] });
+      expect(result.contactIds).toEqual(['c1', 'c2']);
+      expect(result.total).toBe(2);
+    });
+
+    it('filters out blocked contacts', async () => {
+      contactsClient.listAllIds = jest.fn().mockResolvedValue([
+        { id: 'c1', blocked: false },
+        { id: 'c2', blocked: true },
+      ]);
+
+      const result = await service.executeAudienceQuery(
+        {} as any,
+        { type: 'tags', tags: ['suporte'] },
+      );
+
+      expect(result.contactIds).toEqual(['c1']);
+      expect(result.total).toBe(1);
+    });
+
+    it('applies limit/offset over the resolved id list', async () => {
+      contactsClient.listAllIds = jest.fn().mockResolvedValue([
+        { id: 'c1', blocked: false },
+        { id: 'c2', blocked: false },
+        { id: 'c3', blocked: false },
+      ]);
+
+      const result = await service.executeAudienceQuery(
+        {} as any,
+        { type: 'tags', tags: ['suporte'] },
+        1,
+        1,
+      );
+
+      expect(result.contactIds).toEqual(['c2']);
+      expect(result.total).toBe(3);
+    });
+  });
 });
