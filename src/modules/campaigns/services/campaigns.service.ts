@@ -157,6 +157,14 @@ export class CampaignsService {
     // Apply pagination
     queryBuilder.skip(skip).take(per_page);
 
+    // Maps campaign.contactsCount from a COUNT subquery on campaignContacts
+    // (the campaign list otherwise has no way to show total audience size -
+    // sentContacts/failedContacts only cover what's been processed so far).
+    queryBuilder.loadRelationCountAndMap(
+      'campaign.contactsCount',
+      'campaign.campaignContacts',
+    );
+
     const [campaigns, total] = await queryBuilder.getManyAndCount();
 
     return {
