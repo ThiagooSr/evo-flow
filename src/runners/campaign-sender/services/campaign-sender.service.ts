@@ -197,6 +197,24 @@ export class CampaignSenderService {
         continue;
       }
 
+      // Claim the row BEFORE dispatching, not after: two replicas (or a
+      // redelivered `campaigns.send` message after a mid-batch restart) can
+      // both read this row as PENDING at the same time. Claiming first means
+      // only one of them ever calls batchDispatcher.dispatch() - the loser
+      // skips without sending anything. Claiming after dispatch (the previous
+      // order) let BOTH replicas send the real WhatsApp message and only
+      // decided who gets credited afterward, so "lost claim race" was
+      // logged on a contact that had, in fact, already been messaged twice.
+      const claimed = await this.markSent(row);
+      if (!claimed) {
+        result.skipped++;
+        this.logger.warn('skipped: already sent (lost claim race)', {
+          campaignId,
+          contactId,
+        });
+        continue;
+      }
+
       const outcome = await this.batchDispatcher.dispatch({
         campaignId,
         inboxId: campaign.inboxId,
@@ -206,8 +224,9 @@ export class CampaignSenderService {
       });
 
       if (outcome.kind === 'aborted') {
-        // Mid-retry pause/stop (4.5): the contact stays PENDING (no FAILED),
-        // the batch is acked by returning normally, resume reprocesses it.
+        // Mid-retry pause/stop (4.5): the contact must go back to PENDING (no
+        // send happened) so resume reprocesses it - undo the claim above.
+        await this.revertClaim(row);
         result.aborted = true;
         this.logAborted(await this.currentCampaignStatus(campaignId), {
           campaignId,
@@ -217,19 +236,11 @@ export class CampaignSenderService {
       }
 
       if (outcome.kind === 'sent') {
-        const claimed = await this.markSent(row);
-        if (claimed) {
-          result.dispatched++;
-          this.metrics.incThroughput();
-        } else {
-          // Another replica claimed the row between our read and the update.
-          result.skipped++;
-          this.logger.warn('skipped: already sent (lost claim race)', {
-            campaignId,
-            contactId,
-          });
-        }
+        result.dispatched++;
+        this.metrics.incThroughput();
       } else {
+        // Dispatch failed after the claim already flipped the row to SENT -
+        // correct it to FAILED (unconditional: we own this row already).
         await this.markFailed(row, outcome.reason, outcome.statusCode);
         this.metrics.incError(this.dispatchErrorCategory(outcome.statusCode));
         result.failed++;
@@ -416,6 +427,17 @@ export class CampaignSenderService {
     return (updated.affected ?? 0) > 0;
   }
 
+  // Undoes markSent's claim when a mid-retry pause/stop aborts the dispatch
+  // before anything was actually sent - puts the row back to PENDING so a
+  // resume reprocesses it, instead of leaving it stuck as SENT with no
+  // message ever having gone out.
+  private async revertClaim(row: CampaignContact): Promise<void> {
+    await this.campaignContactRepository.update(
+      { id: row.id, status: CampaignContactStatus.SENT },
+      { status: CampaignContactStatus.PENDING, sentAt: null as any },
+    );
+  }
+
   private async markSkipped(row: CampaignContact): Promise<void> {
     await this.campaignContactRepository.update(
       { id: row.id, status: CampaignContactStatus.PENDING },
@@ -433,8 +455,11 @@ export class CampaignSenderService {
     reason: string,
     statusCode?: number,
   ): Promise<void> {
+    // Unconditional by id (no status precondition): called both before the
+    // claim (contact_not_found, still PENDING) and after it (dispatch failed
+    // once we already own the row as SENT) - it must correct either case.
     await this.campaignContactRepository.update(
-      { id: row.id, status: CampaignContactStatus.PENDING },
+      { id: row.id },
       { status: CampaignContactStatus.FAILED },
     );
     this.logger.error('campaign contact failed', {

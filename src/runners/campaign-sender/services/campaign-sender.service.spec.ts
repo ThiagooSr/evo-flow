@@ -200,8 +200,11 @@ describe('CampaignSenderService', () => {
 
     const result = await service.send(payload(['c1']));
 
+    // markFailed corrects a row the claim already flipped to SENT, so it's
+    // unconditional by id (no status precondition) - see markSent-before-
+    // dispatch ordering fix.
     expect(contactUpdate).toHaveBeenCalledWith(
-      { id: 'cc-c1', status: CampaignContactStatus.PENDING },
+      { id: 'cc-c1' },
       { status: CampaignContactStatus.FAILED },
     );
     expect(logger.error).toHaveBeenCalledWith(
@@ -248,7 +251,18 @@ describe('CampaignSenderService', () => {
     const result = await service.send(payload(['c1', 'c2']));
 
     expect(dispatch).toHaveBeenCalledTimes(1);
-    expect(contactUpdate).not.toHaveBeenCalled();
+    // Claimed (PENDING -> SENT) before dispatch, then reverted back to
+    // PENDING since the abort means nothing was actually sent.
+    expect(contactUpdate).toHaveBeenNthCalledWith(
+      1,
+      { id: 'cc-c1', status: CampaignContactStatus.PENDING },
+      { status: CampaignContactStatus.SENT, sentAt: expect.any(Date) },
+    );
+    expect(contactUpdate).toHaveBeenNthCalledWith(
+      2,
+      { id: 'cc-c1', status: CampaignContactStatus.SENT },
+      { status: CampaignContactStatus.PENDING, sentAt: null },
+    );
     expect(result).toEqual({
       dispatched: 0,
       skipped: 0,
@@ -347,6 +361,25 @@ describe('CampaignSenderService', () => {
       { id: 'cc-c1', status: CampaignContactStatus.PENDING },
       { status: CampaignContactStatus.SKIPPED },
     );
+    expect(result.skipped).toBe(1);
+  });
+
+  // Regression: markSent used to run AFTER batchDispatcher.dispatch(), so two
+  // concurrent replicas (or a redelivered campaigns.send after a mid-batch
+  // restart) could both read the row as PENDING and both actually send the
+  // WhatsApp message - the claim only decided who got credited in Postgres
+  // afterward. A real contact received the same template twice this way.
+  // Claiming first means the loser must never call dispatch at all.
+  it('does NOT dispatch when the claim is lost (prevents double-sending the real message)', async () => {
+    campaignFindOne.mockResolvedValue(campaign());
+    contactFind.mockResolvedValue([row('c1')]);
+    findByIds.mockResolvedValue([dto('c1')]);
+    contactUpdate.mockResolvedValue({ affected: 0 });
+
+    const result = await service.send(payload(['c1']));
+
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(result.dispatched).toBe(0);
     expect(result.skipped).toBe(1);
   });
 
