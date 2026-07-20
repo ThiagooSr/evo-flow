@@ -189,8 +189,16 @@ export class Campaign {
     }>;
   };
 
+  // orphanedRowAction: 'disable' - templates are managed exclusively through the
+  // dedicated /campaigns/:id/templates endpoints (CampaignTemplatesService), never
+  // by reassigning campaign.templates and saving. Without this, TypeORM's default
+  // orphan removal kicks in whenever a loaded campaign (with .templates populated
+  // via relations: ['templates']) is saved, and tries to soft-remove any template
+  // row missing from the in-memory array - crashing with MissingDeleteDateColumnError
+  // since CampaignTemplate has no @DeleteDateColumn (it's hard-deleted instead).
   @OneToMany(() => CampaignTemplate, (template) => template.campaign, {
     cascade: true,
+    orphanedRowAction: 'disable',
   })
   templates: CampaignTemplate[];
 

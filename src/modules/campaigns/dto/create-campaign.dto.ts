@@ -9,6 +9,7 @@ import {
   IsNumber,
   IsDateString,
   IsUUID,
+  MaxLength,
   ValidateNested,
 } from 'class-validator';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
@@ -30,6 +31,7 @@ export class CreateCampaignDto {
   })
   @IsString()
   @IsNotEmpty()
+  @MaxLength(40, { message: 'name must be 40 characters or shorter (matches the campaigns.name column)' })
   name: string;
 
   @ApiPropertyOptional({
