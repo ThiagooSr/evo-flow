@@ -208,6 +208,10 @@ export class Campaign {
   )
   campaignContacts: CampaignContact[];
 
+  // Not a real column - populated by loadRelationCountAndMap in
+  // CampaignsService#findAll (total audience size for the campaign list).
+  contactsCount?: number;
+
   @CreateDateColumn({ name: 'created_at' })
   createdAt: Date;
 

@@ -105,3 +105,36 @@ describe('CampaignsService — campaigns.control publishing', () => {
     warnSpy.mockRestore();
   });
 });
+
+// Regression: the campaigns list showed "0 contacts" for every campaign
+// because findAll never loaded a total-audience count - sentContacts/
+// failedContacts only cover contacts already processed, not the full batch.
+describe('CampaignsService#findAll — contactsCount', () => {
+  it('maps campaign.contactsCount via loadRelationCountAndMap on campaignContacts', async () => {
+    const queryBuilder: Record<string, jest.Mock> = {};
+    const chainable = [
+      'andWhere',
+      'orderBy',
+      'skip',
+      'take',
+      'loadRelationCountAndMap',
+    ];
+    chainable.forEach(method => {
+      queryBuilder[method] = jest.fn().mockReturnValue(queryBuilder);
+    });
+    queryBuilder.getManyAndCount = jest.fn().mockResolvedValue([[], 0]);
+
+    const repo = {
+      createQueryBuilder: jest.fn().mockReturnValue(queryBuilder),
+    };
+    const db = { getRepository: jest.fn().mockReturnValue(repo) };
+    const service = new CampaignsService(db as any, {} as any);
+
+    await service.findAll();
+
+    expect(queryBuilder.loadRelationCountAndMap).toHaveBeenCalledWith(
+      'campaign.contactsCount',
+      'campaign.campaignContacts',
+    );
+  });
+});
