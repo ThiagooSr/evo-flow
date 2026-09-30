@@ -61,6 +61,11 @@ export interface ProcessingConfig {
     minConnections?: number;
     acquireTimeoutMs?: number;
     idleTimeoutMs?: number;
+    // Dias que um evento de contato fica em contact_events antes do TTL do
+    // ClickHouse apagá-lo automaticamente (CREATE TABLE ... TTL occurred_at +
+    // INTERVAL n DAY). Só vale para tabelas criadas a partir de agora — não
+    // altera o TTL de uma tabela já existente (ver ALTER TABLE ... MODIFY TTL).
+    eventsRetentionDays?: number;
   };
 
   // Configurações gerais
@@ -189,6 +194,9 @@ export function getProcessingConfig(): ProcessingConfig {
         process.env.CLICKHOUSE_ACQUIRE_TIMEOUT || '45000',
       ),
       idleTimeoutMs: parseInt(process.env.CLICKHOUSE_IDLE_TIMEOUT || '180000'),
+      eventsRetentionDays: parseInt(
+        process.env.CLICKHOUSE_EVENTS_RETENTION_DAYS || '90',
+      ),
     },
 
     // General config

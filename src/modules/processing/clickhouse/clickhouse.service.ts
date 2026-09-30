@@ -631,8 +631,9 @@ export class ClickHouseService implements OnModuleInit, OnModuleDestroy {
 
   async createContactEventsTable(databaseName: string, tableName: string) {
     try {
+      const retentionDays = this.config.clickhouse?.eventsRetentionDays || 90;
       this.logger.log(
-        `Creating table '${databaseName}.${tableName}' with proper schema`,
+        `Creating table '${databaseName}.${tableName}' with proper schema (retention: ${retentionDays} days)`,
       );
 
       const createTableQuery = `
@@ -659,7 +660,7 @@ export class ClickHouseService implements OnModuleInit, OnModuleDestroy {
         ENGINE = MergeTree()
         PARTITION BY toYYYYMM(occurred_at)
         ORDER BY (occurred_at, event_type)
-        TTL occurred_at + INTERVAL 365 DAY
+        TTL occurred_at + INTERVAL ${retentionDays} DAY
         SETTINGS index_granularity = 8192
       `;
 
